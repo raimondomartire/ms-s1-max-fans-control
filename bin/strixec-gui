@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+MS S1 Max fans control - GUI (PySide6).
+
+ASUS/Fan-Xpert-style editable fan curve for the Minisforum MS-S1 MAX: drag the
+curve nodes to shape it, see the live CPU temperature and the current operating
+point, and a prominent "noise rises in +N C" indicator. Curves come from
+`strixec-setcurve dump-profiles`; the active profile from /run/strixec/profile;
+temperature from hwmon (no root). Applying uses pkexec.
+
+Author: Raimondo Martire <martireraimondo@gmail.com>
+License: GPL-2.0
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal
+from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QBrush, QLinearGradient,
+                           QIcon, QPainterPath, QPalette)
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QFrame, QSizePolicy, QMessageBox,
+)
+
+VERSION = "1.1.0"
+SETCURVE = "/usr/local/bin/strixec-setcurve"
+STATE = "/run/strixec/profile"
+ICON = "/usr/local/share/strixec/strixec-fan.svg"
+CUSTOM = "personalizzato"
+
+TR = {
+    "en": {"profile": "Profile:", "apply": "Apply", "custom": "custom",
+           "silent": "\U0001F507 Silent", "audible": "\U0001F509 Audible", "loud": "\U0001F50A Loud",
+           "noise_in": "Noise rises in +{d}°C  (at {t}° → {x}%)",
+           "fans_max": "Fans at maximum", "no_incr": "No further increase",
+           "active": "active: {p}   ·   fan ~{d}", "hint": "Drag the nodes to edit the curve",
+           "applying": "applying…", "applied": "✔ '{n}' applied", "error": "error: {e}",
+           "unknown": "unknown"},
+    "it": {"profile": "Profilo:", "apply": "Applica", "custom": "personalizzato",
+           "silent": "\U0001F507 Silenziose", "audible": "\U0001F509 Udibili", "loud": "\U0001F50A Rumorose",
+           "noise_in": "Il rumore sale tra +{d}°C  (a {t}° → {x}%)",
+           "fans_max": "Ventole al massimo", "no_incr": "Nessun aumento previsto",
+           "active": "attivo: {p}   ·   ventola ~{d}", "hint": "Trascina i nodi per modificare la curva",
+           "applying": "applico…", "applied": "✔ '{n}' applicato", "error": "errore: {e}",
+           "unknown": "sconosciuto"},
+}
+DESC = {
+    "en": {"ultrasilenzioso": "Near-silent; ramps only near Tjmax", "silenzioso": "Quiet; firm ramp above ~85°C",
+           "leggero": "Balanced-quiet; 100% by ~90°C", "bilanciato": "Balanced noise vs temperature",
+           "aggressivo": "Maximum cooling (loud)", "stock": "Factory curve", CUSTOM: "Custom curve (drag the nodes)"},
+    "it": {"ultrasilenzioso": "Quasi mute; salgono solo vicino a Tjmax", "silenzioso": "Silenziose; ramp oltre ~85°C",
+           "leggero": "Bilanciato-quieto; 100% verso ~90°C", "bilanciato": "Rumore/temperatura bilanciati",
+           "aggressivo": "Massimo raffreddamento (rumoroso)", "stock": "Curva di fabbrica", CUSTOM: "Curva personalizzata (trascina i nodi)"},
+}
+CONFIG = os.path.expanduser("~/.config/strixec/gui.json")
+
+
+def load_config():
+    try:
+        return json.load(open(CONFIG))
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        json.dump(cfg, open(CONFIG, "w"))
+    except OSError:
+        pass
+
+
+_cfg = load_config()
+CUR_LANG = _cfg.get("lang") or ("it" if os.environ.get("LANG", "").lower().startswith("it") else "en")
+
+
+def t(k, **kw):
+    return TR[CUR_LANG][k].format(**kw)
+
+
+def dark_palette():
+    pal = QPalette()
+    bg = QColor(38, 41, 48); base = QColor(30, 33, 39); txt = QColor(230, 230, 233)
+    pal.setColor(QPalette.Window, bg); pal.setColor(QPalette.WindowText, txt)
+    pal.setColor(QPalette.Base, base); pal.setColor(QPalette.AlternateBase, bg)
+    pal.setColor(QPalette.Text, txt); pal.setColor(QPalette.Button, bg)
+    pal.setColor(QPalette.ButtonText, txt); pal.setColor(QPalette.ToolTipBase, base)
+    pal.setColor(QPalette.ToolTipText, txt); pal.setColor(QPalette.Highlight, QColor(64, 140, 220))
+    pal.setColor(QPalette.HighlightedText, Qt.white)
+    return pal
+
+
+def read_temp():
+    best = None
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(hw + "/name").read().strip() not in ("k10temp", "amdgpu"):
+                continue
+        except OSError:
+            continue
+        for lbl in glob.glob(hw + "/temp*_label"):
+            try:
+                if open(lbl).read().strip() in ("Tctl", "edge"):
+                    v = int(open(lbl.replace("_label", "_input")).read()) / 1000.0
+                    best = v if best is None else max(best, v)
+            except OSError:
+                pass
+    return best
+
+
+def load_profiles():
+    try:
+        return json.loads(subprocess.check_output([SETCURVE, "dump-profiles"], text=True))
+    except Exception:
+        return {}
+
+
+def active_profile():
+    try:
+        return open(STATE).read().strip()
+    except OSError:
+        return None
+
+
+def duty_at(pts, temp):
+    if temp is None or not pts:
+        return None
+    for tp, d in pts:
+        if temp <= tp:
+            return d
+    return pts[-1][1]
+
+
+def next_louder(pts, temp):
+    if temp is None or not pts:
+        return None
+    cur = duty_at(pts, temp)
+    for tp, d in pts:
+        if tp >= temp and d > cur:
+            return (tp - temp, tp, d)
+    return None
+
+
+class CurveWidget(QFrame):
+    edited = Signal()
+
+    TMIN, TMAX = 30, 100
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(260)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.pts = []            # list of [temp, duty]
+        self.cur_temp = None
+        self.drag = -1
+        self.hover = -1
+        self.dark = False
+
+    def set_theme(self, dark):
+        self.dark = dark
+        self.update()
+
+    def set_curve(self, pts):
+        self.pts = [list(p) for p in pts]
+        self.update()
+
+    def set_temp(self, temp):
+        self.cur_temp = temp
+        self.update()
+
+    def _geo(self):
+        w, h = self.width(), self.height()
+        return 46, 12, w - 16, h - 26
+
+    def _X(self, tp):
+        x0, _, x1, _ = self._geo()
+        return x0 + (max(self.TMIN, min(self.TMAX, tp)) - self.TMIN) / (self.TMAX - self.TMIN) * (x1 - x0)
+
+    def _Y(self, d):
+        _, y0, _, y1 = self._geo()
+        return y1 - max(0, min(100, d)) / 100.0 * (y1 - y0)
+
+    def _Tinv(self, x):
+        x0, _, x1, _ = self._geo()
+        return self.TMIN + (x - x0) / max(1, (x1 - x0)) * (self.TMAX - self.TMIN)
+
+    def _Dinv(self, y):
+        _, y0, _, y1 = self._geo()
+        return (y1 - y) / max(1, (y1 - y0)) * 100.0
+
+    def _node_at(self, pos):
+        for i, (tp, d) in enumerate(self.pts):
+            if abs(self._X(tp) - pos.x()) <= 11 and abs(self._Y(d) - pos.y()) <= 11:
+                return i
+        return -1
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.drag = self._node_at(e.position())
+
+    def mouseMoveEvent(self, e):
+        if self.drag >= 0:
+            i = self.drag
+            lo_t = self.pts[i - 1][0] + 1 if i > 0 else self.TMIN + 2
+            hi_t = self.pts[i + 1][0] - 1 if i < len(self.pts) - 1 else self.TMAX
+            nt = int(round(max(lo_t, min(hi_t, self._Tinv(e.position().x())))))
+            nd = int(round(max(0, min(100, self._Dinv(e.position().y())))))
+            self.pts[i] = [nt, nd]
+            self.edited.emit()
+            self.update()
+        else:
+            self.hover = self._node_at(e.position())
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self.drag >= 0:
+            self.drag = -1
+            self.edited.emit()
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        x0, y0, x1, y1 = self._geo()
+        X, Y = self._X, self._Y
+
+        if self.dark:
+            C = dict(bg=QColor(30, 35, 48), grid=QColor(255, 255, 255, 30), lbl=QColor(160, 168, 185),
+                     g0=QColor(80, 190, 255, 150), g1=QColor(80, 190, 255, 18), line=QColor(90, 200, 255),
+                     node=QColor(40, 140, 220), text=QColor(235, 235, 235),
+                     mark=QColor(255, 170, 60), cur=QColor(255, 80, 80),
+                     z=[(0, 20, QColor(70, 200, 130, 22)), (20, 50, QColor(240, 210, 80, 26)),
+                        (50, 100, QColor(240, 110, 70, 30))], rounded=True)
+        else:
+            C = dict(bg=QColor(250, 250, 252), grid=QColor(0, 0, 0, 45), lbl=QColor(120, 120, 120),
+                     g0=QColor(64, 160, 255, 110), g1=QColor(64, 160, 255, 15), line=QColor(40, 130, 235),
+                     node=QColor(40, 130, 235), text=QColor(40, 40, 40),
+                     mark=QColor(230, 140, 30), cur=QColor(230, 60, 60),
+                     z=[(0, 20, QColor(80, 200, 120, 30)), (20, 50, QColor(240, 200, 60, 38)),
+                        (50, 100, QColor(240, 120, 60, 42))], rounded=False)
+
+        if C["rounded"]:
+            p.setBrush(C["bg"]); p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRectF(x0 - 2, y0 - 2, x1 - x0 + 4, y1 - y0 + 4), 8, 8)
+        else:
+            p.fillRect(QRectF(x0, y0, x1 - x0, y1 - y0), C["bg"])
+
+        for lo, hi, col in C["z"]:
+            p.fillRect(QRectF(x0, Y(hi), x1 - x0, Y(lo) - Y(hi)), col)
+
+        f = QFont(); f.setPointSize(8); p.setFont(f)
+        p.setPen(QPen(C["grid"], 1))
+        for d in range(0, 101, 20):
+            p.drawLine(int(x0), int(Y(d)), int(x1), int(Y(d)))
+            p.setPen(C["lbl"]); p.drawText(6, int(Y(d)) + 4, "%d%%" % d)
+            p.setPen(QPen(C["grid"], 1))
+        for tp in range(40, 101, 10):
+            p.drawLine(int(X(tp)), int(y0), int(X(tp)), int(y1))
+            p.setPen(C["lbl"]); p.drawText(int(X(tp)) - 9, self.height() - 8, "%d°" % tp)
+            p.setPen(QPen(C["grid"], 1))
+
+        if not self.pts:
+            return
+
+        step = [QPointF(X(self.TMIN), Y(self.pts[0][1]))]
+        for i, (tp, d) in enumerate(self.pts):
+            step.append(QPointF(X(tp), Y(d)))
+            nd = self.pts[i + 1][1] if i + 1 < len(self.pts) else d
+            step.append(QPointF(X(tp), Y(nd)))
+        step.append(QPointF(X(self.TMAX), Y(self.pts[-1][1])))
+
+        fill = QPainterPath(QPointF(step[0].x(), Y(0)))
+        for pt in step:
+            fill.lineTo(pt)
+        fill.lineTo(QPointF(step[-1].x(), Y(0))); fill.closeSubpath()
+        g = QLinearGradient(0, y0, 0, y1)
+        g.setColorAt(0, C["g0"]); g.setColorAt(1, C["g1"])
+        p.fillPath(fill, QBrush(g))
+
+        p.setPen(QPen(C["line"], 2.4))
+        for i in range(len(step) - 1):
+            p.drawLine(step[i], step[i + 1])
+
+        # draggable nodes
+        for i, (tp, d) in enumerate(self.pts):
+            r = 8 if i == self.hover or i == self.drag else 6
+            p.setBrush(QColor(255, 255, 255)); p.setPen(QPen(C["node"], 3))
+            p.drawEllipse(QPointF(X(tp), Y(d)), r, r)
+
+        # next louder marker
+        nl = next_louder(self.pts, self.cur_temp)
+        if nl:
+            _, at_t, tgt = nl
+            xm = X(at_t)
+            p.setPen(QPen(C["mark"], 1.6, Qt.DashLine))
+            p.drawLine(int(xm), int(y0), int(xm), int(y1))
+
+        # current operating point
+        if self.cur_temp is not None:
+            d = duty_at(self.pts, self.cur_temp)
+            cx, cy = X(self.cur_temp), Y(d)
+            p.setPen(QPen(C["cur"], 1.5, Qt.DashLine))
+            p.drawLine(int(cx), int(y1), int(cx), int(cy))
+            p.setBrush(C["cur"]); p.setPen(QPen(Qt.white, 2))
+            p.drawEllipse(QPointF(cx, cy), 6, 6)
+            lf = QFont(); lf.setBold(True); lf.setPointSize(9); p.setFont(lf)
+            p.setPen(C["text"])
+            p.drawText(int(min(cx + 10, x1 - 74)), int(max(cy - 8, y0 + 12)),
+                       "%d° → %d%%" % (round(self.cur_temp), d))
+
+    def points(self):
+        return [(int(a), int(b)) for a, b in self.pts]
+
+
+class MainWin(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MS S1 Max fans control")
+        if os.path.exists(ICON):
+            self.setWindowIcon(QIcon(ICON))
+        self.setMinimumSize(600, 520)
+        self.resize(680, 600)
+        self.profiles = load_profiles()
+        self.custom = False
+
+        root = QVBoxLayout(self)
+
+        top = QHBoxLayout(); top.addStretch()
+        self.theme = QComboBox()
+        self.theme.addItem("☀ Chiaro" if CUR_LANG == "it" else "☀ Light", "light")
+        self.theme.addItem("🌙 Scuro" if CUR_LANG == "it" else "🌙 Dark", "dark")
+        self.theme.setCurrentIndex(1 if _cfg.get("theme") == "dark" else 0)
+        self.theme.currentIndexChanged.connect(self.on_theme); top.addWidget(self.theme)
+        self.lang = QComboBox(); self.lang.addItem("Italiano", "it"); self.lang.addItem("English", "en")
+        self.lang.setCurrentIndex(0 if CUR_LANG == "it" else 1)
+        self.lang.currentIndexChanged.connect(self.on_lang); top.addWidget(self.lang)
+        root.addLayout(top)
+
+        head = QHBoxLayout()
+        self.temp_lbl = QLabel("-- °C"); tf = QFont(); tf.setPointSize(34); tf.setBold(True); self.temp_lbl.setFont(tf)
+        head.addWidget(self.temp_lbl)
+        c = QVBoxLayout()
+        self.status_lbl = QLabel("—"); sf = QFont(); sf.setPointSize(13); sf.setBold(True); self.status_lbl.setFont(sf)
+        self.head_lbl = QLabel(""); hf = QFont(); hf.setPointSize(11); self.head_lbl.setFont(hf)
+        c.addStretch(); c.addWidget(self.status_lbl); c.addWidget(self.head_lbl); c.addStretch()
+        head.addLayout(c); head.addStretch(); root.addLayout(head)
+
+        self.sub_lbl = QLabel(""); self.sub_lbl.setStyleSheet("color: gray;"); root.addWidget(self.sub_lbl)
+
+        selrow = QHBoxLayout()
+        self.prof_cap = QLabel(t("profile")); selrow.addWidget(self.prof_cap)
+        self.combo = QComboBox()
+        for n in ["ultrasilenzioso", "silenzioso", "leggero", "bilanciato", "aggressivo", "stock"]:
+            if n in self.profiles:
+                self.combo.addItem(n)
+        self.combo.currentTextChanged.connect(self.on_select); selrow.addWidget(self.combo, 1)
+        self.apply_btn = QPushButton(t("apply")); self.apply_btn.clicked.connect(self.on_apply); selrow.addWidget(self.apply_btn)
+        root.addLayout(selrow)
+        self.desc_lbl = QLabel(""); self.desc_lbl.setStyleSheet("color: gray;"); root.addWidget(self.desc_lbl)
+
+        self.curve = CurveWidget(); self.curve.edited.connect(self.on_edit)
+        root.addWidget(self.curve, 1)
+
+        self.footer = QLabel("MS S1 Max fans control v%s — Raimondo Martire" % VERSION)
+        self.footer.setStyleSheet("color: gray; font-size: 10px;"); self.footer.setAlignment(Qt.AlignRight)
+        root.addWidget(self.footer)
+
+        act = active_profile()
+        if act and self.combo.findText(act) >= 0:
+            self.combo.setCurrentText(act)
+        # Always load the curve at startup: setCurrentText does not emit
+        # currentTextChanged when the value is unchanged, which left the graph empty.
+        self.on_select(self.combo.currentText())
+
+        self.apply_theme(_cfg.get("theme") == "dark")
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(2000)
+        self.refresh()
+
+    def _pts(self, name):
+        raw = self.profiles.get(name)
+        return [tuple(x) for x in raw] if raw else []
+
+    def on_lang(self):
+        global CUR_LANG
+        CUR_LANG = self.lang.currentData()
+        self.prof_cap.setText(t("profile")); self.apply_btn.setText(t("apply"))
+        self.desc_lbl.setText(DESC[CUR_LANG].get(self._cur_name(), ""))
+        _cfg["lang"] = CUR_LANG; save_config(_cfg)
+        self.refresh()
+
+    def on_theme(self):
+        self.apply_theme(self.theme.currentData() == "dark")
+        _cfg["theme"] = self.theme.currentData(); save_config(_cfg)
+
+    def apply_theme(self, dark):
+        app = QApplication.instance()
+        app.setPalette(dark_palette() if dark else app.style().standardPalette())
+        self.curve.set_theme(dark)
+
+    def _cur_name(self):
+        return CUSTOM if self.custom else self.combo.currentText()
+
+    def on_select(self, name):
+        if name and name != CUSTOM:
+            self.custom = False
+            self.curve.set_curve(self._pts(name))
+            self.desc_lbl.setText(DESC[CUR_LANG].get(name, ""))
+            self.refresh()
+
+    def on_edit(self):
+        self.custom = True
+        self.desc_lbl.setText(DESC[CUR_LANG].get(CUSTOM, ""))
+        self.refresh()
+
+    def on_apply(self):
+        self.sub_lbl.setText(t("applying")); QApplication.processEvents()
+        if self.custom:
+            spec = ",".join("%d:%d" % (tp, d) for tp, d in self.curve.points())
+            cmd = ["pkexec", SETCURVE, "custom", spec]; name = CUSTOM
+        else:
+            name = self.combo.currentText(); cmd = ["pkexec", SETCURVE, name]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.sub_lbl.setText(t("applied", n=name) if r.returncode == 0
+                                 else t("error", e=(r.stderr.strip() or r.returncode)))
+        except Exception as ex:
+            QMessageBox.warning(self, "Error", str(ex))
+        self.refresh()
+
+    def refresh(self):
+        temp = read_temp()
+        self.temp_lbl.setText("%.0f °C" % temp if temp is not None else "-- °C")
+        self.curve.set_temp(temp)
+        pts = self.curve.points()
+        d = duty_at(pts, temp)
+        if d is None:
+            self.status_lbl.setText("—"); self.status_lbl.setStyleSheet("")
+        elif d < 20:
+            self.status_lbl.setText(t("silent")); self.status_lbl.setStyleSheet("color:#2e9e4f;")
+        elif d < 50:
+            self.status_lbl.setText(t("audible")); self.status_lbl.setStyleSheet("color:#c79200;")
+        else:
+            self.status_lbl.setText(t("loud")); self.status_lbl.setStyleSheet("color:#d2691e;")
+        nl = next_louder(pts, temp)
+        if nl:
+            dc, at_t, tgt = nl
+            self.head_lbl.setText(t("noise_in", d=round(dc), t=round(at_t), x=tgt))
+        elif d is not None:
+            self.head_lbl.setText(t("fans_max") if d >= 100 else t("no_incr"))
+        else:
+            self.head_lbl.setText("")
+        act = active_profile()
+        shown = (t("custom") if self.custom else (act or t("unknown")))
+        self.sub_lbl.setText(t("hint") + "   ·   " + t("active", p=shown,
+                             d=(("%d%%" % d) if d is not None else "--")))
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("MS S1 Max fans control")
+    if os.path.exists(ICON):
+        app.setWindowIcon(QIcon(ICON))
+    win = MainWin()          # keep a reference (otherwise it is GC'd and the app exits)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+strixec-setcurve - write a fan curve into the Minisforum MS-S1 MAX EC table
+via /dev/strixec. The firmware reads this table live.
+
+EC table (reverse-engineered on this machine):
+  Fan1 base 0x11 | Fan2 base 0x31
+  8 records of 3 bytes each:
+    base + 3*i + 0 : upper temperature of the band (°C)
+    base + 3*i + 1 : lower bound / hysteresis (°C) = previous band's upper temp
+    base + 3*i + 2 : duty (%) applied in the band (lower, upper]
+  So a record's duty applies for temperatures up to its 'upper' value (and above
+  the previous record's 'upper'). All three columns are written consistently.
+
+Profiles are 8 (temp, duty) points; duty is the % for the band ENDING at temp.
+Duty is a linear percentage 0..100 (100 = max, verified).
+
+Usage:
+  sudo strixec-setcurve <profile>     # ultrasilenzioso|silenzioso|leggero|bilanciato|aggressivo|stock
+  sudo strixec-setcurve show          # print the current EC table
+  strixec-setcurve dump-profiles      # JSON of the profiles (used by the GUI)
+"""
+import sys, os, json
+
+DEV = "/dev/strixec"
+FAN_BASES = [0x11, 0x31]          # fan1, fan2
+STATE = "/run/strixec/profile"
+
+# profile -> 7 (upper_temp_C, duty_pct); duty applies for band up to that temp.
+# The EC curve table holds exactly 7 records per fan (0x11..0x25 / 0x31..0x45);
+# offsets 0x26+/0x46+ are NOT part of the writable table (0x28/0x48 are volatile).
+# Above the last record's temperature the firmware holds the last band's duty, so
+# the last duty is 100% (except for the faithful "stock" restore).
+PROFILES = {
+    "ultrasilenzioso": [(55, 6),  (68, 10), (78, 15), (84, 24),
+                        (89, 42), (93, 70), (97, 100)],
+    "silenzioso":      [(50, 12), (62, 20), (72, 28), (80, 42),
+                        (86, 60), (92, 85), (97, 100)],
+    "leggero":         [(48, 20), (58, 32), (68, 45), (78, 62),
+                        (85, 80), (91, 95), (96, 100)],
+    "bilanciato":      [(45, 30), (56, 45), (66, 60), (74, 75),
+                        (82, 90), (89, 100), (95, 100)],
+    "aggressivo":      [(40, 45), (50, 60), (58, 75), (66, 88),
+                        (74, 100), (84, 100), (94, 100)],
+    # exact factory values read from this machine (7 records)
+    "stock":           [(25, 16), (45, 18), (60, 25), (72, 29),
+                        (83, 34), (88, 36), (93, 40)],
+}
+NREC = 7
+
+
+def ec_write(off, val):
+    with open(DEV, "r+b") as f:
+        f.seek(off)
+        f.write(bytes([val & 0xFF]))
+
+
+def ec_read(off):
+    with open(DEV, "rb") as f:
+        f.seek(off)
+        return f.read(1)[0]
+
+
+def _validate(pts):
+    if len(pts) != NREC:
+        raise SystemExit("profile must have %d points" % NREC)
+    prev_t = -1
+    for t, d in pts:
+        if not (0 <= t <= 120) or not (0 <= d <= 100):
+            raise SystemExit("point out of range: %r" % ((t, d),))
+        if t <= prev_t:
+            raise SystemExit("temperatures must be strictly increasing")
+        prev_t = t
+
+
+def apply_points(pts, name):
+    _validate(pts)
+    for base in FAN_BASES:
+        prev = 0
+        for i, (t, d) in enumerate(pts):
+            ec_write(base + 3 * i + 0, int(t))    # upper temp
+            ec_write(base + 3 * i + 1, prev)      # hysteresis = previous upper
+            ec_write(base + 3 * i + 2, int(d))    # duty
+            prev = int(t)
+    _write_state(name)
+    print("curve '%s' applied to fan1(0x%02X) + fan2(0x%02X)." % (name, FAN_BASES[0], FAN_BASES[1]))
+    show()
+
+
+def _write_state(name):
+    try:
+        os.makedirs("/run/strixec", exist_ok=True)
+        with open(STATE, "w") as f:
+            f.write(name + "\n")
+        os.chmod(STATE, 0o644)
+    except OSError:
+        pass
+
+
+def apply_profile(name):
+    apply_points(PROFILES[name], name)
+
+
+def parse_points(spec):
+    """'55:6,68:10,...' -> [(55,6),(68,10),...]"""
+    pts = []
+    for chunk in spec.split(","):
+        t, d = chunk.split(":")
+        pts.append((int(t), int(d)))
+    return pts
+
+
+def show():
+    for base in FAN_BASES:
+        cells = []
+        for i in range(NREC):
+            t = ec_read(base + 3 * i + 0)
+            h = ec_read(base + 3 * i + 1)
+            d = ec_read(base + 3 * i + 2)
+            cells.append("(%d-%d]->%d%%" % (h, t, d))
+        print("  fan@0x%02X: %s" % (base, "  ".join(cells)))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+    a = sys.argv[1]
+    if a == "dump-profiles":
+        print(json.dumps(PROFILES))
+    elif a == "show":
+        show()
+    elif a == "custom":
+        if len(sys.argv) < 3:
+            print("usage: strixec-setcurve custom T1:D1,T2:D2,... (%d points)" % NREC)
+            sys.exit(1)
+        apply_points(parse_points(sys.argv[2]), "personalizzato")
+    elif a in PROFILES:
+        apply_profile(a)
+    else:
+        print("unknown profile: %s (use: %s, custom)" % (a, ", ".join(PROFILES)))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

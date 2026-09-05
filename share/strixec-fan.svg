@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4aa3ff"/>
+      <stop offset="1" stop-color="#2668d8"/>
+    </linearGradient>
+  </defs>
+  <circle cx="64" cy="64" r="60" fill="#eef4fb" stroke="#2668d8" stroke-width="4"/>
+  <g fill="url(#g)">
+    <!-- 4 fan blades rotated around center -->
+    <g>
+      <path d="M64 64 C64 40 74 24 60 12 C50 22 52 44 64 64 Z"/>
+    </g>
+    <g transform="rotate(90 64 64)">
+      <path d="M64 64 C64 40 74 24 60 12 C50 22 52 44 64 64 Z"/>
+    </g>
+    <g transform="rotate(180 64 64)">
+      <path d="M64 64 C64 40 74 24 60 12 C50 22 52 44 64 64 Z"/>
+    </g>
+    <g transform="rotate(270 64 64)">
+      <path d="M64 64 C64 40 74 24 60 12 C50 22 52 44 64 64 Z"/>
+    </g>
+  </g>
+  <circle cx="64" cy="64" r="10" fill="#1b4fa8" stroke="#eef4fb" stroke-width="3"/>
+</svg>

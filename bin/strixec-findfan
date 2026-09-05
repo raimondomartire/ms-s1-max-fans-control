@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+strixec-findfan — ricerca ASSISTITA e SICURA del registro di controllo ventola
+sul MS-S1 MAX, via /dev/strixec.
+
+Perché serve: questo EC non espone tachimetro né un registro duty osservabile,
+e il DSDT è muto sulle ventole. L'unico feedback affidabile è: sotto carico
+sostenuto, scrivere un registro candidato a "max cooling" e vedere se la
+temperatura CPU (EC 0x09, che traccia Tctl) CALA in modo netto. In caso
+positivo, quel registro controlla la ventola.
+
+SICUREZZA:
+  * salva SEMPRE il valore originale del registro e lo RIPRISTINA a fine test
+    (anche su Ctrl-C / errore);
+  * scrive un solo registro alla volta, scelto da te (niente scan cieco);
+  * finestra di test breve.
+ATTENZIONE: stai comunque scrivendo su un Embedded Controller. Testa un offset
+alla volta, parti dai candidati suggeriti, e tieni d'occhio il comportamento.
+
+Uso:
+  sudo strixec-findfan dump                     # mostra i 256 byte EC
+  sudo strixec-findfan temp                      # legge la temp CPU (EC 0x09) e Tctl
+  sudo strixec-findfan test <off> <val> [sec]    # scrive off=val per sec, poi ripristina
+  sudo strixec-findfan hunt <off> [val] [sec]    # carico CPU + misura calo temp scrivendo off=val
+Esempi:
+  sudo strixec-findfan hunt 0x1a 0xe4 20
+  sudo strixec-findfan test 0x1a 0xe4 8
+"""
+import sys, time, os, signal, subprocess
+
+EC = "/dev/strixec"
+TEMP_REG = 0x09  # registro EC che traccia la temp CPU (Tctl), scoperto empiricamente
+
+
+def ec_read_all():
+    with open(EC, "rb") as f:
+        return bytearray(f.read())
+
+
+def ec_read1(off):
+    with open(EC, "rb") as f:
+        f.seek(off)
+        return f.read(1)[0]
+
+
+def ec_write1(off, val):
+    with open(EC, "r+b") as f:
+        f.seek(off)
+        f.write(bytes([val & 0xFF]))
+
+
+def cmd_dump():
+    d = ec_read_all()
+    for row in range(0, 256, 16):
+        hexs = " ".join("%02x" % d[row + i] for i in range(16))
+        print("0x%02X:  %s" % (row, hexs))
+
+
+def cmd_temp():
+    print("EC 0x09 = %d C" % ec_read1(TEMP_REG))
+    try:
+        out = subprocess.check_output(["sensors"], text=True)
+        for l in out.splitlines():
+            if "Tctl" in l:
+                print(l.strip())
+    except Exception:
+        pass
+
+
+def _restore(off, orig):
+    try:
+        ec_write1(off, orig)
+        print("  ripristinato 0x%02X = 0x%02X" % (off, orig))
+    except Exception as e:
+        print("  ATTENZIONE: ripristino fallito: %s" % e)
+
+
+def cmd_test(off, val, secs):
+    orig = ec_read1(off)
+    print("registro 0x%02X: valore attuale 0x%02X" % (off, orig))
+    print("scrivo 0x%02X per %ds — ASCOLTA se la ventola cambia…" % (val, secs))
+    handler = lambda *_: (_restore(off, orig), sys.exit(0))
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    try:
+        ec_write1(off, val)
+        for s in range(secs, 0, -1):
+            print("  ...%2ds  (EC0x09=%dC)" % (s, ec_read1(TEMP_REG)), end="\r", flush=True)
+            time.sleep(1)
+        print()
+    finally:
+        _restore(off, orig)
+
+
+def _load_start():
+    procs = []
+    n = os.cpu_count() or 4
+    for _ in range(n):
+        procs.append(subprocess.Popen(["bash", "-c", "while :; do :; done"]))
+    return procs
+
+
+def _load_stop(procs):
+    for p in procs:
+        p.terminate()
+    for p in procs:
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            p.kill()
+
+
+def cmd_hunt(off, val, secs):
+    orig = ec_read1(off)
+    print("=== HUNT registro 0x%02X (val test 0x%02X) ===" % (off, val))
+    print("valore originale: 0x%02X" % orig)
+    handler = lambda *_: (_restore(off, orig), sys.exit(0))
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    procs = _load_start()
+    try:
+        print("carico CPU avviato, stabilizzo temperatura (20s)…")
+        for s in range(20, 0, -1):
+            print("  warmup %2ds  EC0x09=%dC" % (s, ec_read1(TEMP_REG)), end="\r", flush=True)
+            time.sleep(1)
+        print()
+        base = max(ec_read1(TEMP_REG) for _ in range(3))
+        print("temp base sotto carico: %dC" % base)
+        print("scrivo 0x%02X = 0x%02X e osservo %ds…" % (off, val, secs))
+        ec_write1(off, val)
+        lo = base
+        for s in range(secs, 0, -1):
+            t = ec_read1(TEMP_REG)
+            lo = min(lo, t)
+            print("  ...%2ds  EC0x09=%dC (min %dC)" % (s, t, lo), end="\r", flush=True)
+            time.sleep(1)
+        print()
+        delta = base - lo
+        print("RISULTATO: temp %dC -> %dC  (calo %d C)" % (base, lo, delta))
+        if delta >= 4:
+            print(">>> CANDIDATO PROBABILE: 0x%02X sembra aumentare il raffreddamento!" % off)
+        else:
+            print(">>> nessun calo netto: 0x%02X probabilmente NON è il registro ventola." % off)
+    finally:
+        _restore(off, orig)
+        _load_stop(procs)
+
+
+def _to_int(s):
+    return int(s, 0)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+    c = sys.argv[1]
+    if c == "dump":
+        cmd_dump()
+    elif c == "temp":
+        cmd_temp()
+    elif c == "test":
+        cmd_test(_to_int(sys.argv[2]), _to_int(sys.argv[3]),
+                 int(sys.argv[4]) if len(sys.argv) > 4 else 8)
+    elif c == "hunt":
+        cmd_hunt(_to_int(sys.argv[2]),
+                 _to_int(sys.argv[3]) if len(sys.argv) > 3 else 0xE4,
+                 int(sys.argv[4]) if len(sys.argv) > 4 else 20)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

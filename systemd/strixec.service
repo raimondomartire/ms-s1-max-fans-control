@@ -1,0 +1,15 @@
+[Unit]
+Description=strixec: EC access module (/dev/strixec) for MS-S1 MAX
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target
+Before=strix-halo-fand.service
+ConditionPathExists=/opt/strixec/strixec.c
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/strixec/build-sign-load.sh
+ExecStop=/sbin/rmmod strixec
+
+[Install]
+WantedBy=multi-user.target

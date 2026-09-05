@@ -1,0 +1,17 @@
+[Unit]
+Description=Applica la curva ventole (MS-S1 MAX) alla tabella EC via /dev/strixec
+Requires=strixec.service
+After=strixec.service
+ConditionPathExists=/dev/strixec
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Profilo scelto dall'utente. Cambiabile con: strixec-setcurve <profilo>
+# e aggiornando questa riga (profili: ultrasilenzioso, silenzioso, leggero,
+# bilanciato, aggressivo, stock).
+ExecStart=/usr/local/bin/strixec-setcurve ultrasilenzioso
+# Al reboot/spegnimento non serve ripristinare: il firmware riparte da stock.
+
+[Install]
+WantedBy=multi-user.target
