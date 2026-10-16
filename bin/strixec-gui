@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QProcess
 from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QBrush, QLinearGradient,
                            QIcon, QPainterPath, QPalette)
 from PySide6.QtWidgets import (
@@ -38,6 +38,7 @@ TR = {
            "fans_max": "Fans at maximum", "no_incr": "No further increase",
            "active": "active: {p}   ·   fan ~{d}", "hint": "Drag the nodes to edit the curve",
            "applying": "applying…", "applied": "✔ '{n}' applied", "error": "error: {e}",
+           "cancelled": "authorization cancelled",
            "unknown": "unknown"},
     "it": {"profile": "Profilo:", "apply": "Applica", "custom": "personalizzato",
            "silent": "\U0001F507 Silenziose", "audible": "\U0001F509 Udibili", "loud": "\U0001F50A Rumorose",
@@ -45,6 +46,7 @@ TR = {
            "fans_max": "Ventole al massimo", "no_incr": "Nessun aumento previsto",
            "active": "attivo: {p}   ·   ventola ~{d}", "hint": "Trascina i nodi per modificare la curva",
            "applying": "applico…", "applied": "✔ '{n}' applicato", "error": "errore: {e}",
+           "cancelled": "autorizzazione annullata",
            "unknown": "sconosciuto"},
 }
 DESC = {
@@ -94,21 +96,22 @@ def dark_palette():
 
 
 def read_temp():
-    best = None
+    # The EC drives the fans from the CPU temperature (EC 0x09 tracks Tctl), so
+    # show Tctl only: the GPU "edge" sensor would move the operating point away
+    # from what the firmware actually reads.
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         try:
-            if open(hw + "/name").read().strip() not in ("k10temp", "amdgpu"):
+            if open(hw + "/name").read().strip() != "k10temp":
                 continue
         except OSError:
             continue
         for lbl in glob.glob(hw + "/temp*_label"):
             try:
-                if open(lbl).read().strip() in ("Tctl", "edge"):
-                    v = int(open(lbl.replace("_label", "_input")).read()) / 1000.0
-                    best = v if best is None else max(best, v)
+                if open(lbl).read().strip() == "Tctl":
+                    return int(open(lbl.replace("_label", "_input")).read()) / 1000.0
             except OSError:
                 pass
-    return best
+    return None
 
 
 def load_profiles():
@@ -350,6 +353,9 @@ class MainWin(QWidget):
         head.addLayout(c); head.addStretch(); root.addLayout(head)
 
         self.sub_lbl = QLabel(""); self.sub_lbl.setStyleSheet("color: gray;"); root.addWidget(self.sub_lbl)
+        self.msg_lbl = QLabel(""); root.addWidget(self.msg_lbl)
+        self.proc = None
+        self.pending = None
 
         selrow = QHBoxLayout()
         self.prof_cap = QLabel(t("profile")); selrow.addWidget(self.prof_cap)
@@ -359,6 +365,8 @@ class MainWin(QWidget):
                 self.combo.addItem(n)
         self.combo.currentTextChanged.connect(self.on_select); selrow.addWidget(self.combo, 1)
         self.apply_btn = QPushButton(t("apply")); self.apply_btn.clicked.connect(self.on_apply); selrow.addWidget(self.apply_btn)
+        if not self.profiles:
+            self.apply_btn.setEnabled(False)
         root.addLayout(selrow)
         self.desc_lbl = QLabel(""); self.desc_lbl.setStyleSheet("color: gray;"); root.addWidget(self.desc_lbl)
 
@@ -377,6 +385,7 @@ class MainWin(QWidget):
         self.on_select(self.combo.currentText())
 
         self.apply_theme(_cfg.get("theme") == "dark")
+        self.temp = None
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(2000)
         self.refresh()
 
@@ -414,25 +423,40 @@ class MainWin(QWidget):
     def on_edit(self):
         self.custom = True
         self.desc_lbl.setText(DESC[CUR_LANG].get(CUSTOM, ""))
-        self.refresh()
+        self.render(self.temp)
 
     def on_apply(self):
-        self.sub_lbl.setText(t("applying")); QApplication.processEvents()
+        if self.proc is not None:          # one apply at a time
+            return
         if self.custom:
             spec = ",".join("%d:%d" % (tp, d) for tp, d in self.curve.points())
-            cmd = ["pkexec", SETCURVE, "custom", spec]; name = CUSTOM
+            args = ["custom", spec]; self.pending = CUSTOM
         else:
-            name = self.combo.currentText(); cmd = ["pkexec", SETCURVE, name]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            self.sub_lbl.setText(t("applied", n=name) if r.returncode == 0
-                                 else t("error", e=(r.stderr.strip() or r.returncode)))
-        except Exception as ex:
-            QMessageBox.warning(self, "Error", str(ex))
+            self.pending = self.combo.currentText(); args = [self.pending]
+        # pkexec may wait for a password: run it asynchronously so the window keeps responding
+        self.proc = QProcess(self)
+        self.proc.finished.connect(self.on_applied)
+        self.apply_btn.setEnabled(False); self.combo.setEnabled(False)
+        self.msg_lbl.setText(t("applying"))
+        self.proc.start("pkexec", [SETCURVE] + args)
+
+    def on_applied(self, code, _status):
+        err = bytes(self.proc.readAllStandardError()).decode(errors="replace").strip()
+        self.proc.deleteLater(); self.proc = None
+        self.apply_btn.setEnabled(True); self.combo.setEnabled(True)
+        if code == 0:
+            self.msg_lbl.setText(t("applied", n=self.pending))
+        elif code == 126:                  # pkexec: authorization dismissed
+            self.msg_lbl.setText(t("cancelled"))
+        else:
+            self.msg_lbl.setText(t("error", e=err or code))
         self.refresh()
 
     def refresh(self):
-        temp = read_temp()
+        self.temp = read_temp()
+        self.render(self.temp)
+
+    def render(self, temp):
         self.temp_lbl.setText("%.0f °C" % temp if temp is not None else "-- °C")
         self.curve.set_temp(temp)
         pts = self.curve.points()
