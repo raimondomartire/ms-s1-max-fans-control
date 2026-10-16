@@ -30,6 +30,9 @@ SETCURVE = "/usr/local/bin/strixec-setcurve"
 STATE = "/run/strixec/profile"
 ICON = "/usr/local/share/strixec/strixec-fan.svg"
 CUSTOM = "personalizzato"
+# Raw EC duty scale; overwritten from `strixec-setcurve dump-profiles` at startup.
+# Shown to the user as a percentage of this value (see pct()).
+FAN_MAX = 48
 
 TR = {
     "en": {"profile": "Profile:", "apply": "Apply", "custom": "custom",
@@ -115,10 +118,18 @@ def read_temp():
 
 
 def load_profiles():
+    global FAN_MAX
     try:
-        return json.loads(subprocess.check_output([SETCURVE, "dump-profiles"], text=True))
+        data = json.loads(subprocess.check_output([SETCURVE, "dump-profiles"], text=True))
     except Exception:
         return {}
+    FAN_MAX = int(data.get("fan_max", FAN_MAX))
+    return data.get("profiles", {})
+
+
+def pct(raw):
+    """Raw EC duty -> percentage of full speed (what the UI displays)."""
+    return raw * 100.0 / FAN_MAX
 
 
 def active_profile():
@@ -185,7 +196,7 @@ class CurveWidget(QFrame):
 
     def _Y(self, d):
         _, y0, _, y1 = self._geo()
-        return y1 - max(0, min(100, d)) / 100.0 * (y1 - y0)
+        return y1 - max(0, min(FAN_MAX, d)) / float(FAN_MAX) * (y1 - y0)
 
     def _Tinv(self, x):
         x0, _, x1, _ = self._geo()
@@ -193,7 +204,7 @@ class CurveWidget(QFrame):
 
     def _Dinv(self, y):
         _, y0, _, y1 = self._geo()
-        return (y1 - y) / max(1, (y1 - y0)) * 100.0
+        return (y1 - y) / max(1, (y1 - y0)) * FAN_MAX
 
     def _node_at(self, pos):
         for i, (tp, d) in enumerate(self.pts):
@@ -211,7 +222,7 @@ class CurveWidget(QFrame):
             lo_t = self.pts[i - 1][0] + 1 if i > 0 else self.TMIN + 2
             hi_t = self.pts[i + 1][0] - 1 if i < len(self.pts) - 1 else self.TMAX
             nt = int(round(max(lo_t, min(hi_t, self._Tinv(e.position().x())))))
-            nd = int(round(max(0, min(100, self._Dinv(e.position().y())))))
+            nd = int(round(max(0, min(FAN_MAX, self._Dinv(e.position().y())))))
             self.pts[i] = [nt, nd]
             self.edited.emit()
             self.update()
@@ -252,14 +263,17 @@ class CurveWidget(QFrame):
         else:
             p.fillRect(QRectF(x0, y0, x1 - x0, y1 - y0), C["bg"])
 
+        def Yp(pc):   # percent of full speed -> y
+            return self._Y(pc * FAN_MAX / 100.0)
+
         for lo, hi, col in C["z"]:
-            p.fillRect(QRectF(x0, Y(hi), x1 - x0, Y(lo) - Y(hi)), col)
+            p.fillRect(QRectF(x0, Yp(hi), x1 - x0, Yp(lo) - Yp(hi)), col)
 
         f = QFont(); f.setPointSize(8); p.setFont(f)
         p.setPen(QPen(C["grid"], 1))
         for d in range(0, 101, 20):
-            p.drawLine(int(x0), int(Y(d)), int(x1), int(Y(d)))
-            p.setPen(C["lbl"]); p.drawText(6, int(Y(d)) + 4, "%d%%" % d)
+            p.drawLine(int(x0), int(Yp(d)), int(x1), int(Yp(d)))
+            p.setPen(C["lbl"]); p.drawText(6, int(Yp(d)) + 4, "%d%%" % d)
             p.setPen(QPen(C["grid"], 1))
         for tp in range(40, 101, 10):
             p.drawLine(int(X(tp)), int(y0), int(X(tp)), int(y1))
@@ -313,7 +327,7 @@ class CurveWidget(QFrame):
             lf = QFont(); lf.setBold(True); lf.setPointSize(9); p.setFont(lf)
             p.setPen(C["text"])
             p.drawText(int(min(cx + 10, x1 - 74)), int(max(cy - 8, y0 + 12)),
-                       "%d° → %d%%" % (round(self.cur_temp), d))
+                       "%d° → %d%%" % (round(self.cur_temp), round(pct(d))))
 
     def points(self):
         return [(int(a), int(b)) for a, b in self.pts]
@@ -463,24 +477,24 @@ class MainWin(QWidget):
         d = duty_at(pts, temp)
         if d is None:
             self.status_lbl.setText("—"); self.status_lbl.setStyleSheet("")
-        elif d < 20:
+        elif pct(d) < 20:
             self.status_lbl.setText(t("silent")); self.status_lbl.setStyleSheet("color:#2e9e4f;")
-        elif d < 50:
+        elif pct(d) < 50:
             self.status_lbl.setText(t("audible")); self.status_lbl.setStyleSheet("color:#c79200;")
         else:
             self.status_lbl.setText(t("loud")); self.status_lbl.setStyleSheet("color:#d2691e;")
         nl = next_louder(pts, temp)
         if nl:
             dc, at_t, tgt = nl
-            self.head_lbl.setText(t("noise_in", d=round(dc), t=round(at_t), x=tgt))
+            self.head_lbl.setText(t("noise_in", d=round(dc), t=round(at_t), x=round(pct(tgt))))
         elif d is not None:
-            self.head_lbl.setText(t("fans_max") if d >= 100 else t("no_incr"))
+            self.head_lbl.setText(t("fans_max") if d >= FAN_MAX else t("no_incr"))
         else:
             self.head_lbl.setText("")
         act = active_profile()
         shown = (t("custom") if self.custom else (act or t("unknown")))
         self.sub_lbl.setText(t("hint") + "   ·   " + t("active", p=shown,
-                             d=(("%d%%" % d) if d is not None else "--")))
+                             d=(("%d%%" % round(pct(d))) if d is not None else "--")))
 
 
 def main():

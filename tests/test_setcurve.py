@@ -69,6 +69,15 @@ class SetcurveTest(unittest.TestCase):
             self.sc.parse_points("55:6,68-10")
         self.assertIn("68-10", str(cm.exception))
 
+    def test_profiles_fit_the_raw_scale(self):
+        for name, pts in self.sc.PROFILES.items():
+            for _, d in pts:
+                self.assertTrue(0 <= d <= self.sc.FAN_MAX, (name, d))
+
+    def test_duty_above_scale_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.sc._validate([(t, 49) for t in range(40, 40 + 7 * 5, 5)])
+
     def test_parse_points_ok(self):
         self.assertEqual(self.sc.parse_points("55:6,68:10"), [(55, 6), (68, 10)])
 

@@ -44,7 +44,7 @@ class GuiTest(unittest.TestCase):
         self.gui = load(GUI, "strixec_gui")
         self.gui.CONFIG = os.path.join(tempfile.mkdtemp(), "gui.json")
         self.gui.STATE = os.path.join(tempfile.mkdtemp(), "profile")
-        profiles = json.dumps(self.sc.PROFILES)
+        profiles = json.dumps({"fan_max": self.sc.FAN_MAX, "profiles": self.sc.PROFILES})
         patcher = mock.patch.object(self.gui.subprocess, "check_output", return_value=profiles)
         patcher.start(); self.addCleanup(patcher.stop)
         self.real_read_temp = self.gui.read_temp
@@ -55,6 +55,17 @@ class GuiTest(unittest.TestCase):
 
     def test_profiles_loaded(self):
         self.assertGreaterEqual(self.win.combo.count(), 5)
+
+    def test_scale_comes_from_setcurve(self):
+        self.assertEqual(self.gui.FAN_MAX, self.sc.FAN_MAX)
+        self.assertEqual(self.gui.pct(self.gui.FAN_MAX), 100.0)
+        self.assertEqual(self.gui.pct(0), 0.0)
+
+    def test_status_reports_maximum_at_raw_fan_max(self):
+        self.read_temp.return_value = 99.0
+        self.win.combo.setCurrentText("aggressivo")
+        self.win.refresh()
+        self.assertEqual(self.win.head_lbl.text(), self.gui.t("fans_max"))
 
     def test_edit_does_not_reread_sensors(self):
         self.read_temp.reset_mock()

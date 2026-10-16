@@ -40,17 +40,23 @@ holds the last band's duty, so the last duty should be 100 %.
 > writable curve table: `0x28`/`0x48` are volatile (firmware-updated) and must
 > not be used as curve bytes.
 
-`duty` is a linear percentage `0..100` (100 = maximum; verified: forcing high
-duty under load dropped the APU temperature by ~8 °C and audibly spun the fans
-up). This tool writes only the **temperature** and **duty** columns.
+`duty` is a raw EC value. The working hypothesis is a scale of `0..48` (48 = full
+speed, about 4800 RPM at RPM/100 units), from acoustic measurements that rise
+with the value up to ~48 and then flatten. This is **not** tachometer-verified.
+Earlier notes assumed `0..100`; forcing high duty under load did drop the APU
+temperature by ~8 °C, which fits either scale. The tools write only the
+**temperature** and **duty** columns; the GUI shows duty as a percentage of
+`FAN_MAX` (48).
 
 ### Factory (stock) curve
 
+Raw values (scale hypothesis above):
+
 ```
-25°C→16%  45°C→18%  60°C→25%  72°C→29%  83°C→34%  88°C→36%  93°C→40%  98°C→(max)
+25°C→16  45°C→18  60°C→25  72°C→29  83°C→34  88°C→36  93°C→40  98°C→(max)
 ```
 
-The stock curve reaches only ~40 % near 93 °C, which is why the APU throttles
+The stock curve reaches only 40/48 (~83 %) near 93 °C, which is why the APU throttles
 under sustained load.
 
 ## Platform notes (Fedora + Secure Boot)

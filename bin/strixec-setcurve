@@ -12,13 +12,15 @@ EC table (reverse-engineered on this machine):
   So a record's duty applies for temperatures up to its 'upper' value (and above
   the previous record's 'upper'). All three columns are written consistently.
 
-Profiles are 8 (temp, duty) points; duty is the % for the band ENDING at temp.
-Duty is a linear percentage 0..100 (100 = max, verified).
+Profiles are 7 (temp, duty) points; duty is the raw EC value for the band ENDING
+at temp. Raw values run 0..FAN_MAX. FAN_MAX = 48 is a working hypothesis (about
+4800 RPM at RPM/100 units, from acoustic measurements; not tachometer-verified).
+The GUI shows duty as a percentage of FAN_MAX.
 
 Usage:
   sudo strixec-setcurve <profile>     # ultrasilenzioso|silenzioso|leggero|bilanciato|aggressivo|stock
   sudo strixec-setcurve show          # print the current EC table
-  strixec-setcurve dump-profiles      # JSON of the profiles (used by the GUI)
+  strixec-setcurve dump-profiles      # JSON {"fan_max", "profiles"} (used by the GUI)
 """
 import sys, os, json
 
@@ -31,17 +33,22 @@ STATE = "/run/strixec/profile"
 # offsets 0x26+/0x46+ are NOT part of the writable table (0x28/0x48 are volatile).
 # Above the last record's temperature the firmware holds the last band's duty, so
 # the last duty is 100% (except for the faithful "stock" restore).
+# Raw EC duty scale. 48 = full speed (hypothesis, see module docstring).
+FAN_MAX = 48
+
+# Profiles below were first written as % of full scale and rescaled to raw values
+# with round(pct * FAN_MAX / 100). "stock" is the factory bytes, not rescaled.
 PROFILES = {
-    "ultrasilenzioso": [(55, 6),  (68, 10), (78, 15), (84, 24),
-                        (89, 42), (93, 70), (97, 100)],
-    "silenzioso":      [(50, 12), (62, 20), (72, 28), (80, 42),
-                        (86, 60), (92, 85), (97, 100)],
-    "leggero":         [(48, 20), (58, 32), (68, 45), (78, 62),
-                        (85, 80), (91, 95), (96, 100)],
-    "bilanciato":      [(45, 30), (56, 45), (66, 60), (74, 75),
-                        (82, 90), (89, 100), (95, 100)],
-    "aggressivo":      [(40, 45), (50, 60), (58, 75), (66, 88),
-                        (74, 100), (84, 100), (94, 100)],
+    "ultrasilenzioso": [(55, 3),  (68, 5),  (78, 7),  (84, 12),
+                        (89, 20), (93, 34), (97, 48)],
+    "silenzioso":      [(50, 6),  (62, 10), (72, 13), (80, 20),
+                        (86, 29), (92, 41), (97, 48)],
+    "leggero":         [(48, 10), (58, 15), (68, 22), (78, 30),
+                        (85, 38), (91, 46), (96, 48)],
+    "bilanciato":      [(45, 14), (56, 22), (66, 29), (74, 36),
+                        (82, 43), (89, 48), (95, 48)],
+    "aggressivo":      [(40, 22), (50, 29), (58, 36), (66, 42),
+                        (74, 48), (84, 48), (94, 48)],
     # exact factory values read from this machine (7 records)
     "stock":           [(25, 16), (45, 18), (60, 25), (72, 29),
                         (83, 34), (88, 36), (93, 40)],
@@ -66,8 +73,8 @@ def _validate(pts):
         raise SystemExit("profile must have %d points" % NREC)
     prev_t = -1
     for t, d in pts:
-        if not (0 <= t <= 120) or not (0 <= d <= 100):
-            raise SystemExit("point out of range: %r" % ((t, d),))
+        if not (0 <= t <= 120) or not (0 <= d <= FAN_MAX):
+            raise SystemExit("point out of range (temp 0..120, duty 0..%d): %r" % (FAN_MAX, (t, d)))
         if t <= prev_t:
             raise SystemExit("temperatures must be strictly increasing")
         prev_t = t
@@ -135,7 +142,7 @@ def show():
             t = ec_read(base + 3 * i + 0)
             h = ec_read(base + 3 * i + 1)
             d = ec_read(base + 3 * i + 2)
-            cells.append("(%d-%d]->%d%%" % (h, t, d))
+            cells.append("(%d-%d]->%d/%d" % (h, t, d, FAN_MAX))
         print("  fan@0x%02X: %s" % (base, "  ".join(cells)))
 
 
@@ -145,12 +152,12 @@ def main():
         return
     a = sys.argv[1]
     if a == "dump-profiles":
-        print(json.dumps(PROFILES))
+        print(json.dumps({"fan_max": FAN_MAX, "profiles": PROFILES}))
     elif a == "show":
         show()
     elif a == "custom":
         if len(sys.argv) < 3:
-            print("usage: strixec-setcurve custom T1:D1,T2:D2,... (%d points)" % NREC)
+            print("usage: strixec-setcurve custom T1:D1,T2:D2,... (%d points, duty 0..%d)" % (NREC, FAN_MAX))
             sys.exit(1)
         apply_points(parse_points(sys.argv[2]), "personalizzato")
     elif a in PROFILES:
