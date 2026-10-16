@@ -33,11 +33,11 @@ static ssize_t strixec_read(struct file *f, char __user *ubuf,
 		if (ec_read((u8)pos, &val))
 			return i ? (ssize_t)i : -EIO;
 		if (put_user(val, ubuf + i))
-			return -EFAULT;
+			return i ? (ssize_t)i : -EFAULT;
 		i++;
 		pos++;
+		*ppos = pos;	/* advance per byte: a short return must leave ppos at the next byte */
 	}
-	*ppos = pos;
 	return i;
 }
 
@@ -53,13 +53,13 @@ static ssize_t strixec_write(struct file *f, const char __user *ubuf,
 
 	while (i < count && pos < EC_SPACE_SIZE) {
 		if (get_user(val, ubuf + i))
-			return -EFAULT;
+			return i ? (ssize_t)i : -EFAULT;
 		if (ec_write((u8)pos, val))
 			return i ? (ssize_t)i : -EIO;
 		i++;
 		pos++;
+		*ppos = pos;	/* advance per byte: a retry must resume at the byte that failed */
 	}
-	*ppos = pos;
 	return i;
 }
 
