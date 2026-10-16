@@ -73,15 +73,30 @@ def _validate(pts):
         prev_t = t
 
 
+def _table_offsets():
+    return [base + k for base in FAN_BASES for k in range(3 * NREC)]
+
+
 def apply_points(pts, name):
     _validate(pts)
-    for base in FAN_BASES:
-        prev = 0
-        for i, (t, d) in enumerate(pts):
-            ec_write(base + 3 * i + 0, int(t))    # upper temp
-            ec_write(base + 3 * i + 1, prev)      # hysteresis = previous upper
-            ec_write(base + 3 * i + 2, int(d))    # duty
-            prev = int(t)
+    # Snapshot the live table first: the firmware reads it at any moment, so a
+    # write that fails half-way must not leave a mixed curve behind.
+    saved = [(off, ec_read(off)) for off in _table_offsets()]
+    try:
+        for base in FAN_BASES:
+            prev = 0
+            for i, (t, d) in enumerate(pts):
+                ec_write(base + 3 * i + 0, int(t))    # upper temp
+                ec_write(base + 3 * i + 1, prev)      # hysteresis = previous upper
+                ec_write(base + 3 * i + 2, int(d))    # duty
+                prev = int(t)
+    except OSError as e:
+        for off, val in saved:
+            try:
+                ec_write(off, val)
+            except OSError:
+                pass
+        raise SystemExit("write failed (%s): previous curve restored, nothing applied" % e)
     _write_state(name)
     print("curve '%s' applied to fan1(0x%02X) + fan2(0x%02X)." % (name, FAN_BASES[0], FAN_BASES[1]))
     show()
@@ -105,8 +120,11 @@ def parse_points(spec):
     """'55:6,68:10,...' -> [(55,6),(68,10),...]"""
     pts = []
     for chunk in spec.split(","):
-        t, d = chunk.split(":")
-        pts.append((int(t), int(d)))
+        try:
+            t, d = chunk.split(":")
+            pts.append((int(t), int(d)))
+        except ValueError:
+            raise SystemExit("bad point %r: expected TEMP:DUTY, e.g. 55:6,68:10,..." % chunk)
     return pts
 
 

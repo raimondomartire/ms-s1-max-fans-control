@@ -63,9 +63,15 @@ static ssize_t strixec_write(struct file *f, const char __user *ubuf,
 	return i;
 }
 
+/* SEEK_END must mean the end of the 256-byte EC space, not the (zero) inode size */
+static loff_t strixec_llseek(struct file *f, loff_t off, int whence)
+{
+	return fixed_size_llseek(f, off, whence, EC_SPACE_SIZE);
+}
+
 static const struct file_operations strixec_fops = {
 	.owner   = THIS_MODULE,
-	.llseek  = default_llseek,
+	.llseek  = strixec_llseek,
 	.read    = strixec_read,
 	.write   = strixec_write,
 };
