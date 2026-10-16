@@ -22,7 +22,7 @@ from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QBrush, QLinearGradien
                            QIcon, QPainterPath, QPalette)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QFrame, QSizePolicy, QMessageBox,
+    QComboBox, QFrame, QSizePolicy, QToolButton, QMenu, QInputDialog,
 )
 
 VERSION = "1.1.0"
@@ -30,9 +30,7 @@ SETCURVE = "/usr/local/bin/strixec-setcurve"
 STATE = "/run/strixec/profile"
 ICON = "/usr/local/share/strixec/strixec-fan.svg"
 CUSTOM = "personalizzato"
-# Raw EC duty scale; overwritten from `strixec-setcurve dump-profiles` at startup.
-# Shown to the user as a percentage of this value (see pct()).
-FAN_MAX = 48
+SPEED_TEST_SECONDS = 15
 
 TR = {
     "en": {"profile": "Profile:", "apply": "Apply", "custom": "custom",
@@ -42,6 +40,11 @@ TR = {
            "active": "active: {p}   ·   fan ~{d}", "hint": "Drag the nodes to edit the curve",
            "applying": "applying…", "applied": "✔ '{n}' applied", "error": "error: {e}",
            "cancelled": "authorization cancelled",
+           "settings": "⚙ Settings", "scale_item": "Fan scale…", "test_item": "Speed test…",
+           "scale_title": "Fan scale", "scale_prompt": "Raw value for full speed (10–255).\n100 = default. 48 = hypothesis under test.",
+           "scale_set": "✔ fan scale set to {n}", "test_title": "Speed test",
+           "test_prompt": "Fan speed to hold for %d s (%% of full speed):" % SPEED_TEST_SECONDS,
+           "testing": "holding {p}% for {s} s…", "test_done": "✔ speed test finished, previous curve restored",
            "unknown": "unknown"},
     "it": {"profile": "Profilo:", "apply": "Applica", "custom": "personalizzato",
            "silent": "\U0001F507 Silenziose", "audible": "\U0001F509 Udibili", "loud": "\U0001F50A Rumorose",
@@ -50,6 +53,11 @@ TR = {
            "active": "attivo: {p}   ·   ventola ~{d}", "hint": "Trascina i nodi per modificare la curva",
            "applying": "applico…", "applied": "✔ '{n}' applicato", "error": "errore: {e}",
            "cancelled": "autorizzazione annullata",
+           "settings": "⚙ Impostazioni", "scale_item": "Scala ventole…", "test_item": "Prova velocità…",
+           "scale_title": "Scala ventole", "scale_prompt": "Valore grezzo a pieno giri (10–255).\n100 = predefinito. 48 = ipotesi in verifica.",
+           "scale_set": "✔ scala ventole impostata a {n}", "test_title": "Prova velocità",
+           "test_prompt": "Velocità da mantenere per %d s (%% del massimo):" % SPEED_TEST_SECONDS,
+           "testing": "mantengo {p}% per {s} s…", "test_done": "✔ prova terminata, curva precedente ripristinata",
            "unknown": "sconosciuto"},
 }
 DESC = {
@@ -117,19 +125,20 @@ def read_temp():
     return None
 
 
+def read_scale():
+    try:
+        return int(json.loads(subprocess.check_output([SETCURVE, "dump-profiles"], text=True)).get("scale", 100))
+    except Exception:
+        return 100
+
+
 def load_profiles():
-    global FAN_MAX
+    """Profiles in percent of full speed, as `strixec-setcurve dump-profiles` reports them."""
     try:
         data = json.loads(subprocess.check_output([SETCURVE, "dump-profiles"], text=True))
     except Exception:
         return {}
-    FAN_MAX = int(data.get("fan_max", FAN_MAX))
     return data.get("profiles", {})
-
-
-def pct(raw):
-    """Raw EC duty -> percentage of full speed (what the UI displays)."""
-    return raw * 100.0 / FAN_MAX
 
 
 def active_profile():
@@ -196,7 +205,7 @@ class CurveWidget(QFrame):
 
     def _Y(self, d):
         _, y0, _, y1 = self._geo()
-        return y1 - max(0, min(FAN_MAX, d)) / float(FAN_MAX) * (y1 - y0)
+        return y1 - max(0, min(100, d)) / 100.0 * (y1 - y0)
 
     def _Tinv(self, x):
         x0, _, x1, _ = self._geo()
@@ -204,7 +213,7 @@ class CurveWidget(QFrame):
 
     def _Dinv(self, y):
         _, y0, _, y1 = self._geo()
-        return (y1 - y) / max(1, (y1 - y0)) * FAN_MAX
+        return (y1 - y) / max(1, (y1 - y0)) * 100.0
 
     def _node_at(self, pos):
         for i, (tp, d) in enumerate(self.pts):
@@ -222,7 +231,7 @@ class CurveWidget(QFrame):
             lo_t = self.pts[i - 1][0] + 1 if i > 0 else self.TMIN + 2
             hi_t = self.pts[i + 1][0] - 1 if i < len(self.pts) - 1 else self.TMAX
             nt = int(round(max(lo_t, min(hi_t, self._Tinv(e.position().x())))))
-            nd = int(round(max(0, min(FAN_MAX, self._Dinv(e.position().y())))))
+            nd = int(round(max(0, min(100, self._Dinv(e.position().y())))))
             self.pts[i] = [nt, nd]
             self.edited.emit()
             self.update()
@@ -263,17 +272,14 @@ class CurveWidget(QFrame):
         else:
             p.fillRect(QRectF(x0, y0, x1 - x0, y1 - y0), C["bg"])
 
-        def Yp(pc):   # percent of full speed -> y
-            return self._Y(pc * FAN_MAX / 100.0)
-
         for lo, hi, col in C["z"]:
-            p.fillRect(QRectF(x0, Yp(hi), x1 - x0, Yp(lo) - Yp(hi)), col)
+            p.fillRect(QRectF(x0, Y(hi), x1 - x0, Y(lo) - Y(hi)), col)
 
         f = QFont(); f.setPointSize(8); p.setFont(f)
         p.setPen(QPen(C["grid"], 1))
         for d in range(0, 101, 20):
-            p.drawLine(int(x0), int(Yp(d)), int(x1), int(Yp(d)))
-            p.setPen(C["lbl"]); p.drawText(6, int(Yp(d)) + 4, "%d%%" % d)
+            p.drawLine(int(x0), int(Y(d)), int(x1), int(Y(d)))
+            p.setPen(C["lbl"]); p.drawText(6, int(Y(d)) + 4, "%d%%" % d)
             p.setPen(QPen(C["grid"], 1))
         for tp in range(40, 101, 10):
             p.drawLine(int(X(tp)), int(y0), int(X(tp)), int(y1))
@@ -327,7 +333,7 @@ class CurveWidget(QFrame):
             lf = QFont(); lf.setBold(True); lf.setPointSize(9); p.setFont(lf)
             p.setPen(C["text"])
             p.drawText(int(min(cx + 10, x1 - 74)), int(max(cy - 8, y0 + 12)),
-                       "%d° → %d%%" % (round(self.cur_temp), round(pct(d))))
+                       "%d° → %d%%" % (round(self.cur_temp), round(d)))
 
     def points(self):
         return [(int(a), int(b)) for a, b in self.pts]
@@ -347,6 +353,13 @@ class MainWin(QWidget):
         root = QVBoxLayout(self)
 
         top = QHBoxLayout(); top.addStretch()
+        self.settings_btn = QToolButton(); self.settings_btn.setText(t("settings"))
+        self.settings_btn.setPopupMode(QToolButton.InstantPopup)
+        self.settings_menu = QMenu(self.settings_btn)
+        self.settings_menu.addAction(t("scale_item"), self.on_scale)
+        self.settings_menu.addAction(t("test_item"), self.on_speed_test)
+        self.settings_btn.setMenu(self.settings_menu)
+        top.addWidget(self.settings_btn)
         self.theme = QComboBox()
         self.theme.addItem("☀ Chiaro" if CUR_LANG == "it" else "☀ Light", "light")
         self.theme.addItem("🌙 Scuro" if CUR_LANG == "it" else "🌙 Dark", "dark")
@@ -370,6 +383,7 @@ class MainWin(QWidget):
         self.msg_lbl = QLabel(""); root.addWidget(self.msg_lbl)
         self.proc = None
         self.pending = None
+        self.ok_text = ""
 
         selrow = QHBoxLayout()
         self.prof_cap = QLabel(t("profile")); selrow.addWidget(self.prof_cap)
@@ -379,8 +393,7 @@ class MainWin(QWidget):
                 self.combo.addItem(n)
         self.combo.currentTextChanged.connect(self.on_select); selrow.addWidget(self.combo, 1)
         self.apply_btn = QPushButton(t("apply")); self.apply_btn.clicked.connect(self.on_apply); selrow.addWidget(self.apply_btn)
-        if not self.profiles:
-            self.apply_btn.setEnabled(False)
+        self.apply_btn.setEnabled(bool(self.profiles))
         root.addLayout(selrow)
         self.desc_lbl = QLabel(""); self.desc_lbl.setStyleSheet("color: gray;"); root.addWidget(self.desc_lbl)
 
@@ -440,26 +453,46 @@ class MainWin(QWidget):
         self.render(self.temp)
 
     def on_apply(self):
-        if self.proc is not None:          # one apply at a time
-            return
         if self.custom:
             spec = ",".join("%d:%d" % (tp, d) for tp, d in self.curve.points())
-            args = ["custom", spec]; self.pending = CUSTOM
+            name = CUSTOM; args = ["custom", spec]
         else:
-            self.pending = self.combo.currentText(); args = [self.pending]
-        # pkexec may wait for a password: run it asynchronously so the window keeps responding
+            name = self.combo.currentText(); args = [name]
+        self.start_job(args, t("applying"), t("applied", n=name), name)
+
+    def on_scale(self):
+        cur = read_scale()
+        n, ok = QInputDialog.getInt(self, t("scale_title"), t("scale_prompt"), cur, 10, 255)
+        if ok and n != cur:
+            self.start_job(["set-scale", str(n)], t("applying"), t("scale_set", n=n), "scale")
+
+    def on_speed_test(self):
+        pct, ok = QInputDialog.getInt(self, t("test_title"), t("test_prompt"), 40, 10, 100)
+        if ok:
+            self.start_job(["test", str(pct), str(SPEED_TEST_SECONDS)],
+                           t("testing", p=pct, s=SPEED_TEST_SECONDS), t("test_done"), "test")
+
+    def start_job(self, args, busy_text, ok_text, name):
+        """Run `pkexec strixec-setcurve ...` without blocking the window (it may wait for a password)."""
+        if self.proc is not None:            # one job at a time
+            return
+        self.pending = name; self.ok_text = ok_text
         self.proc = QProcess(self)
         self.proc.finished.connect(self.on_applied)
-        self.apply_btn.setEnabled(False); self.combo.setEnabled(False)
-        self.msg_lbl.setText(t("applying"))
+        self.set_busy(True)
+        self.msg_lbl.setText(busy_text)
         self.proc.start("pkexec", [SETCURVE] + args)
+
+    def set_busy(self, busy):
+        for w in (self.apply_btn, self.combo, self.settings_btn):
+            w.setEnabled(not busy and (w is not self.apply_btn or bool(self.profiles)))
 
     def on_applied(self, code, _status):
         err = bytes(self.proc.readAllStandardError()).decode(errors="replace").strip()
         self.proc.deleteLater(); self.proc = None
-        self.apply_btn.setEnabled(True); self.combo.setEnabled(True)
+        self.set_busy(False)
         if code == 0:
-            self.msg_lbl.setText(t("applied", n=self.pending))
+            self.msg_lbl.setText(self.ok_text)
         elif code == 126:                  # pkexec: authorization dismissed
             self.msg_lbl.setText(t("cancelled"))
         else:
@@ -477,24 +510,24 @@ class MainWin(QWidget):
         d = duty_at(pts, temp)
         if d is None:
             self.status_lbl.setText("—"); self.status_lbl.setStyleSheet("")
-        elif pct(d) < 20:
+        elif d < 20:
             self.status_lbl.setText(t("silent")); self.status_lbl.setStyleSheet("color:#2e9e4f;")
-        elif pct(d) < 50:
+        elif d < 50:
             self.status_lbl.setText(t("audible")); self.status_lbl.setStyleSheet("color:#c79200;")
         else:
             self.status_lbl.setText(t("loud")); self.status_lbl.setStyleSheet("color:#d2691e;")
         nl = next_louder(pts, temp)
         if nl:
             dc, at_t, tgt = nl
-            self.head_lbl.setText(t("noise_in", d=round(dc), t=round(at_t), x=round(pct(tgt))))
+            self.head_lbl.setText(t("noise_in", d=round(dc), t=round(at_t), x=tgt))
         elif d is not None:
-            self.head_lbl.setText(t("fans_max") if d >= FAN_MAX else t("no_incr"))
+            self.head_lbl.setText(t("fans_max") if d >= 100 else t("no_incr"))
         else:
             self.head_lbl.setText("")
         act = active_profile()
         shown = (t("custom") if self.custom else (act or t("unknown")))
         self.sub_lbl.setText(t("hint") + "   ·   " + t("active", p=shown,
-                             d=(("%d%%" % round(pct(d))) if d is not None else "--")))
+                             d=(("%d%%" % round(d)) if d is not None else "--")))
 
 
 def main():

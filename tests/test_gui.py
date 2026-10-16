@@ -44,7 +44,8 @@ class GuiTest(unittest.TestCase):
         self.gui = load(GUI, "strixec_gui")
         self.gui.CONFIG = os.path.join(tempfile.mkdtemp(), "gui.json")
         self.gui.STATE = os.path.join(tempfile.mkdtemp(), "profile")
-        profiles = json.dumps({"fan_max": self.sc.FAN_MAX, "profiles": self.sc.PROFILES})
+        self.sc.SCALE_FILE = os.path.join(tempfile.mkdtemp(), "fan-scale")   # absent: default scale
+        profiles = json.dumps({"scale": 100, "profiles": {k: [[t, d] for t, d in v] for k, v in self.sc.PROFILES.items()}})
         patcher = mock.patch.object(self.gui.subprocess, "check_output", return_value=profiles)
         patcher.start(); self.addCleanup(patcher.stop)
         self.real_read_temp = self.gui.read_temp
@@ -56,12 +57,7 @@ class GuiTest(unittest.TestCase):
     def test_profiles_loaded(self):
         self.assertGreaterEqual(self.win.combo.count(), 5)
 
-    def test_scale_comes_from_setcurve(self):
-        self.assertEqual(self.gui.FAN_MAX, self.sc.FAN_MAX)
-        self.assertEqual(self.gui.pct(self.gui.FAN_MAX), 100.0)
-        self.assertEqual(self.gui.pct(0), 0.0)
-
-    def test_status_reports_maximum_at_raw_fan_max(self):
+    def test_status_reports_maximum(self):
         self.read_temp.return_value = 99.0
         self.win.combo.setCurrentText("aggressivo")
         self.win.refresh()
@@ -76,18 +72,18 @@ class GuiTest(unittest.TestCase):
 
     def test_apply_message_survives_refresh(self):
         self.win.pending = "silenzioso"
-        self.win.on_applied_result = None
-        self.win.msg_lbl.setText("")
+        self.win.ok_text = "OK silenzioso"
         self.win.proc = mock.Mock()
         self.win.proc.readAllStandardError.return_value = b""
         self.win.on_applied(0, 0)
         self.win.refresh(); self.win.refresh()
-        self.assertIn("silenzioso", self.win.msg_lbl.text())
+        self.assertEqual(self.win.msg_lbl.text(), "OK silenzioso")
 
     def test_cancelled_authorization_message(self):
         self.win.proc = mock.Mock()
         self.win.proc.readAllStandardError.return_value = b""
         self.win.pending = "silenzioso"
+        self.win.ok_text = "OK"
         self.win.on_applied(126, 0)
         self.assertTrue(any(w in self.win.msg_lbl.text().lower() for w in ("annullat", "cancel")),
                         self.win.msg_lbl.text())
@@ -116,6 +112,27 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(started["cmd"][0], "pkexec")
         started["cb"](0, 0)
         self.assertTrue(self.win.apply_btn.isEnabled())
+
+    def test_speed_test_and_scale_build_the_right_commands(self):
+        calls = []
+        self.win.start_job = lambda args, busy, ok, name: calls.append(args)
+        with mock.patch.object(self.gui.QInputDialog, "getInt", return_value=(35, True)):
+            self.win.on_speed_test()
+            self.assertEqual(calls[-1], ["test", "35", str(self.gui.SPEED_TEST_SECONDS)])
+        with mock.patch.object(self.gui.QInputDialog, "getInt", return_value=(48, True)):
+            self.win.on_scale()
+            self.assertEqual(calls[-1], ["set-scale", "48"])
+        with mock.patch.object(self.gui.QInputDialog, "getInt", return_value=(0, False)):
+            n = len(calls)
+            self.win.on_scale()
+            self.assertEqual(len(calls), n)                 # cancelled dialog runs nothing
+
+    def test_busy_locks_settings_and_apply(self):
+        self.win.set_busy(True)
+        self.assertFalse(self.win.settings_btn.isEnabled())
+        self.assertFalse(self.win.apply_btn.isEnabled())
+        self.win.set_busy(False)
+        self.assertTrue(self.win.settings_btn.isEnabled())
 
     def test_temperature_is_cpu_tctl_only(self):
         from unittest import mock as m

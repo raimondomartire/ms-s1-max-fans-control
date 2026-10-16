@@ -5,55 +5,53 @@ via /dev/strixec. The firmware reads this table live.
 
 EC table (reverse-engineered on this machine):
   Fan1 base 0x11 | Fan2 base 0x31
-  8 records of 3 bytes each:
+  7 records of 3 bytes each:
     base + 3*i + 0 : upper temperature of the band (°C)
     base + 3*i + 1 : lower bound / hysteresis (°C) = previous band's upper temp
-    base + 3*i + 2 : duty (%) applied in the band (lower, upper]
+    base + 3*i + 2 : raw duty value applied in the band (lower, upper]
   So a record's duty applies for temperatures up to its 'upper' value (and above
   the previous record's 'upper'). All three columns are written consistently.
 
-Profiles are 7 (temp, duty) points; duty is the raw EC value for the band ENDING
-at temp. Raw values run 0..FAN_MAX. FAN_MAX = 48 is a working hypothesis (about
-4800 RPM at RPM/100 units, from acoustic measurements; not tachometer-verified).
-The GUI shows duty as a percentage of FAN_MAX.
+Duty scale: the raw value that means full speed is the "fan scale" (default 100,
+stored in /etc/strixec/fan-scale). Profiles are written as a percentage of that
+scale. 48 is a working hypothesis (about 4800 RPM at RPM/100 units, from acoustic
+measurements; not tachometer-verified): set it with `set-scale 48` to test it.
 
 Usage:
-  sudo strixec-setcurve <profile>     # ultrasilenzioso|silenzioso|leggero|bilanciato|aggressivo|stock
-  sudo strixec-setcurve show          # print the current EC table
-  strixec-setcurve dump-profiles      # JSON {"fan_max", "profiles"} (used by the GUI)
+  sudo strixec-setcurve <profile>        # ultrasilenzioso|silenzioso|leggero|bilanciato|aggressivo|stock
+  sudo strixec-setcurve custom T:P,...   # 7 points, P = percent of full speed
+  sudo strixec-setcurve set-scale N      # raw value for full speed (10..255), re-applies the active profile
+  sudo strixec-setcurve test P SECONDS   # hold a fixed speed (P percent), then restore the previous table
+  sudo strixec-setcurve show             # print the current EC table
+  strixec-setcurve dump-profiles         # JSON {"scale", "profiles"} in percent (used by the GUI)
 """
-import sys, os, json
+import sys, os, json, signal, time
 
 DEV = "/dev/strixec"
 FAN_BASES = [0x11, 0x31]          # fan1, fan2
 STATE = "/run/strixec/profile"
-
-# profile -> 7 (upper_temp_C, duty_pct); duty applies for band up to that temp.
-# The EC curve table holds exactly 7 records per fan (0x11..0x25 / 0x31..0x45);
-# offsets 0x26+/0x46+ are NOT part of the writable table (0x28/0x48 are volatile).
-# Above the last record's temperature the firmware holds the last band's duty, so
-# the last duty is 100% (except for the faithful "stock" restore).
-# Raw EC duty scale. 48 = full speed (hypothesis, see module docstring).
-FAN_MAX = 48
-
-# Profiles below were first written as % of full scale and rescaled to raw values
-# with round(pct * FAN_MAX / 100). "stock" is the factory bytes, not rescaled.
-PROFILES = {
-    "ultrasilenzioso": [(55, 3),  (68, 5),  (78, 7),  (84, 12),
-                        (89, 20), (93, 34), (97, 48)],
-    "silenzioso":      [(50, 6),  (62, 10), (72, 13), (80, 20),
-                        (86, 29), (92, 41), (97, 48)],
-    "leggero":         [(48, 10), (58, 15), (68, 22), (78, 30),
-                        (85, 38), (91, 46), (96, 48)],
-    "bilanciato":      [(45, 14), (56, 22), (66, 29), (74, 36),
-                        (82, 43), (89, 48), (95, 48)],
-    "aggressivo":      [(40, 22), (50, 29), (58, 36), (66, 42),
-                        (74, 48), (84, 48), (94, 48)],
-    # exact factory values read from this machine (7 records)
-    "stock":           [(25, 16), (45, 18), (60, 25), (72, 29),
-                        (83, 34), (88, 36), (93, 40)],
-}
+SCALE_FILE = "/etc/strixec/fan-scale"
+DEFAULT_SCALE = 100
+SCALE_MIN, SCALE_MAX = 10, 255
 NREC = 7
+
+# profile -> 7 (upper_temp_C, percent of full speed); the percent applies for band up to that temp.
+# Above the last record's temperature the firmware holds the last band's duty.
+PROFILES = {
+    "ultrasilenzioso": [(55, 6),  (68, 10), (78, 15), (84, 24),
+                        (89, 42), (93, 70), (97, 100)],
+    "silenzioso":      [(50, 12), (62, 20), (72, 28), (80, 42),
+                        (86, 60), (92, 85), (97, 100)],
+    "leggero":         [(48, 20), (58, 32), (68, 45), (78, 62),
+                        (85, 80), (91, 95), (96, 100)],
+    "bilanciato":      [(45, 30), (56, 45), (66, 60), (74, 75),
+                        (82, 90), (89, 100), (95, 100)],
+    "aggressivo":      [(40, 45), (50, 60), (58, 75), (66, 88),
+                        (74, 100), (84, 100), (94, 100)],
+}
+# "stock" is the factory bytes read from this machine, written raw whatever the scale.
+STOCK = [(25, 16), (45, 18), (60, 25), (72, 29), (83, 34), (88, 36), (93, 40)]
+NAMED = list(PROFILES) + ["stock"]
 
 
 def ec_write(off, val):
@@ -68,13 +66,33 @@ def ec_read(off):
         return f.read(1)[0]
 
 
-def _validate(pts):
+def get_scale():
+    try:
+        v = int(open(SCALE_FILE).read().strip())
+        if SCALE_MIN <= v <= SCALE_MAX:
+            return v
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SCALE
+
+
+def to_raw(pct, scale):
+    return max(0, min(scale, int(round(pct * scale / 100.0))))
+
+
+def profile_raw(name, scale):
+    if name == "stock":
+        return list(STOCK)
+    return [(t, to_raw(d, scale)) for t, d in PROFILES[name]]
+
+
+def _validate_raw(pts):
     if len(pts) != NREC:
         raise SystemExit("profile must have %d points" % NREC)
     prev_t = -1
     for t, d in pts:
-        if not (0 <= t <= 120) or not (0 <= d <= FAN_MAX):
-            raise SystemExit("point out of range (temp 0..120, duty 0..%d): %r" % (FAN_MAX, (t, d)))
+        if not (0 <= t <= 120) or not (0 <= d <= 255):
+            raise SystemExit("point out of range (temp 0..120): %r" % ((t, d),))
         if t <= prev_t:
             raise SystemExit("temperatures must be strictly increasing")
         prev_t = t
@@ -84,8 +102,9 @@ def _table_offsets():
     return [base + k for base in FAN_BASES for k in range(3 * NREC)]
 
 
-def apply_points(pts, name):
-    _validate(pts)
+def _write_table(pts):
+    """Write raw points to both fans. On a failed write, restore the previous bytes."""
+    _validate_raw(pts)
     # Snapshot the live table first: the firmware reads it at any moment, so a
     # write that fails half-way must not leave a mixed curve behind.
     saved = [(off, ec_read(off)) for off in _table_offsets()]
@@ -98,15 +117,86 @@ def apply_points(pts, name):
                 ec_write(base + 3 * i + 2, int(d))    # duty
                 prev = int(t)
     except OSError as e:
-        for off, val in saved:
-            try:
-                ec_write(off, val)
-            except OSError:
-                pass
+        restore_bytes(saved)
         raise SystemExit("write failed (%s): previous curve restored, nothing applied" % e)
+
+
+def restore_bytes(saved):
+    for off, val in saved:
+        try:
+            ec_write(off, val)
+        except OSError:
+            pass
+
+
+def apply_points(pts_pct, name):
+    """Apply a curve given in percent of full speed."""
+    scale = get_scale()
+    raw = [(t, to_raw(d, scale)) for t, d in pts_pct]
+    _write_table(raw)
     _write_state(name)
-    print("curve '%s' applied to fan1(0x%02X) + fan2(0x%02X)." % (name, FAN_BASES[0], FAN_BASES[1]))
+    print("curve '%s' applied (scale %d) to fan1(0x%02X) + fan2(0x%02X)." % (name, scale, FAN_BASES[0], FAN_BASES[1]))
     show()
+
+
+def apply_profile(name):
+    if name == "stock":
+        _write_table(STOCK)
+        _write_state(name)
+        print("curve 'stock' applied (factory bytes) to fan1(0x%02X) + fan2(0x%02X)." % (FAN_BASES[0], FAN_BASES[1]))
+        show()
+    else:
+        apply_points(PROFILES[name], name)
+
+
+def set_scale(value):
+    if not (SCALE_MIN <= value <= SCALE_MAX):
+        raise SystemExit("scale must be %d..%d" % (SCALE_MIN, SCALE_MAX))
+    os.makedirs(os.path.dirname(SCALE_FILE), exist_ok=True)
+    with open(SCALE_FILE, "w") as f:
+        f.write("%d\n" % value)
+    os.chmod(SCALE_FILE, 0o644)
+    print("fan scale set to %d (raw value for full speed)." % value)
+    # Re-apply the active profile so the table matches the new scale.
+    try:
+        active = open(STATE).read().strip()
+    except OSError:
+        active = ""
+    if active in PROFILES:
+        apply_profile(active)
+
+
+def speed_test(pct, seconds):
+    """Hold a fixed fan speed for `seconds`, then put the previous table back."""
+    scale = get_scale()
+    raw = to_raw(pct, scale)
+    saved = [(off, ec_read(off)) for off in _table_offsets()]
+    flat = [(t, raw) for t in (40, 50, 60, 70, 80, 90, 97)]
+
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        _write_table(flat)
+        print("holding %d%% (raw %d of %d) for %d s, then restoring the previous curve." % (pct, raw, scale, seconds))
+        sys.stdout.flush()
+        time.sleep(seconds)
+    finally:
+        restore_bytes(saved)
+        print("previous curve restored.")
+
+
+def parse_points(spec):
+    """'55:6,68:10,...' -> [(55,6),(68,10),...]"""
+    pts = []
+    for chunk in spec.split(","):
+        try:
+            t, d = chunk.split(":")
+            pts.append((int(t), int(d)))
+        except ValueError:
+            raise SystemExit("bad point %r: expected TEMP:PERCENT, e.g. 55:6,68:10,..." % chunk)
+    return pts
 
 
 def _write_state(name):
@@ -119,22 +209,6 @@ def _write_state(name):
         pass
 
 
-def apply_profile(name):
-    apply_points(PROFILES[name], name)
-
-
-def parse_points(spec):
-    """'55:6,68:10,...' -> [(55,6),(68,10),...]"""
-    pts = []
-    for chunk in spec.split(","):
-        try:
-            t, d = chunk.split(":")
-            pts.append((int(t), int(d)))
-        except ValueError:
-            raise SystemExit("bad point %r: expected TEMP:DUTY, e.g. 55:6,68:10,..." % chunk)
-    return pts
-
-
 def show():
     for base in FAN_BASES:
         cells = []
@@ -142,8 +216,19 @@ def show():
             t = ec_read(base + 3 * i + 0)
             h = ec_read(base + 3 * i + 1)
             d = ec_read(base + 3 * i + 2)
-            cells.append("(%d-%d]->%d/%d" % (h, t, d, FAN_MAX))
+            cells.append("(%d-%d]->%d" % (h, t, d))
         print("  fan@0x%02X: %s" % (base, "  ".join(cells)))
+
+
+def dump_profiles():
+    scale = get_scale()
+    out = {}
+    for name in NAMED:
+        if name == "stock":
+            out[name] = [[t, round(d * 100.0 / scale, 1)] for t, d in STOCK]
+        else:
+            out[name] = [[t, d] for t, d in PROFILES[name]]
+    print(json.dumps({"scale": scale, "profiles": out}))
 
 
 def main():
@@ -152,18 +237,33 @@ def main():
         return
     a = sys.argv[1]
     if a == "dump-profiles":
-        print(json.dumps({"fan_max": FAN_MAX, "profiles": PROFILES}))
+        dump_profiles()
     elif a == "show":
+        print("fan scale: %d" % get_scale())
         show()
     elif a == "custom":
         if len(sys.argv) < 3:
-            print("usage: strixec-setcurve custom T1:D1,T2:D2,... (%d points, duty 0..%d)" % (NREC, FAN_MAX))
+            print("usage: strixec-setcurve custom T1:P1,T2:P2,... (%d points, percent 0..100)" % NREC)
             sys.exit(1)
-        apply_points(parse_points(sys.argv[2]), "personalizzato")
-    elif a in PROFILES:
+        pts = parse_points(sys.argv[2])
+        if len(pts) != NREC or any(not (0 <= d <= 100) for _, d in pts):
+            raise SystemExit("custom needs %d points with percent 0..100" % NREC)
+        apply_points(pts, "personalizzato")
+    elif a == "set-scale":
+        if len(sys.argv) < 3:
+            raise SystemExit("usage: strixec-setcurve set-scale N   (N = %d..%d)" % (SCALE_MIN, SCALE_MAX))
+        set_scale(int(sys.argv[2]))
+    elif a == "test":
+        if len(sys.argv) < 4:
+            raise SystemExit("usage: strixec-setcurve test PERCENT SECONDS")
+        pct, secs = int(sys.argv[2]), int(sys.argv[3])
+        if not (0 <= pct <= 100) or not (1 <= secs <= 120):
+            raise SystemExit("test needs percent 0..100 and 1..120 seconds")
+        speed_test(pct, secs)
+    elif a in NAMED:
         apply_profile(a)
     else:
-        print("unknown profile: %s (use: %s, custom)" % (a, ", ".join(PROFILES)))
+        print("unknown profile: %s (use: %s, custom, set-scale, test, show)" % (a, ", ".join(NAMED)))
         sys.exit(1)
 
 

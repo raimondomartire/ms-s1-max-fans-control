@@ -40,23 +40,23 @@ holds the last band's duty, so the last duty should be 100 %.
 > writable curve table: `0x28`/`0x48` are volatile (firmware-updated) and must
 > not be used as curve bytes.
 
-`duty` is a raw EC value. The working hypothesis is a scale of `0..48` (48 = full
-speed, about 4800 RPM at RPM/100 units), from acoustic measurements that rise
-with the value up to ~48 and then flatten. This is **not** tachometer-verified.
-Earlier notes assumed `0..100`; forcing high duty under load did drop the APU
-temperature by ~8 °C, which fits either scale. The tools write only the
-**temperature** and **duty** columns; the GUI shows duty as a percentage of
-`FAN_MAX` (48).
+`duty` is a raw EC value. The default fan scale is `100` (raw value for full
+speed), which keeps the profiles as written. A scale of `48` (about 4800 RPM at
+RPM/100 units) is a hypothesis from acoustic measurements that rise with the
+value up to ~48 and then flatten; it is **not** tachometer-verified. Set it with
+`strixec-setcurve set-scale 48` (stored in `/etc/strixec/fan-scale`). The tools
+write only the **temperature** and **duty** columns. `strixec-setcurve test P S`
+holds P % of full speed for S seconds and then restores the previous table.
 
 ### Factory (stock) curve
 
-Raw values (scale hypothesis above):
+Raw values (independent of the scale setting):
 
 ```
 25°C→16  45°C→18  60°C→25  72°C→29  83°C→34  88°C→36  93°C→40  98°C→(max)
 ```
 
-The stock curve reaches only 40/48 (~83 %) near 93 °C, which is why the APU throttles
+The stock curve reaches only 40 (40 % at scale 100, ~83 % at scale 48) near 93 °C, which is why the APU throttles
 under sustained load.
 
 ## Platform notes (Fedora + Secure Boot)
