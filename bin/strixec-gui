@@ -19,7 +19,7 @@ import sys
 
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QProcess
 from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QBrush, QLinearGradient,
-                           QIcon, QPainterPath, QPalette)
+                           QIcon, QPainterPath)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QSizePolicy, QToolButton, QMenu, QInputDialog,
@@ -94,16 +94,54 @@ def t(k, **kw):
     return TR[CUR_LANG][k].format(**kw)
 
 
-def dark_palette():
-    pal = QPalette()
-    bg = QColor(38, 41, 48); base = QColor(30, 33, 39); txt = QColor(230, 230, 233)
-    pal.setColor(QPalette.Window, bg); pal.setColor(QPalette.WindowText, txt)
-    pal.setColor(QPalette.Base, base); pal.setColor(QPalette.AlternateBase, bg)
-    pal.setColor(QPalette.Text, txt); pal.setColor(QPalette.Button, bg)
-    pal.setColor(QPalette.ButtonText, txt); pal.setColor(QPalette.ToolTipBase, base)
-    pal.setColor(QPalette.ToolTipText, txt); pal.setColor(QPalette.Highlight, QColor(64, 140, 220))
-    pal.setColor(QPalette.HighlightedText, Qt.white)
-    return pal
+# Colour tokens for both themes. Everything outside the curve canvas is styled from these.
+THEMES = {
+    "light": dict(bg="#f3f4f7", card="#ffffff", border="#dfe3ea", text="#1c2230", muted="#667085",
+                  accent="#2563c9", accent_text="#ffffff", hover="#eef2fa", field="#ffffff",
+                  silent="#17794a", silent_bg="#e3f5ea", audible="#9a6200", audible_bg="#fcf1d8",
+                  loud="#b4441a", loud_bg="#fbe7de"),
+    "dark": dict(bg="#161921", card="#1f2430", border="#2d3442", text="#e7eaf0", muted="#98a2b3",
+                 accent="#4f8ef0", accent_text="#0d1220", hover="#2a3142", field="#252b38",
+                 silent="#4ade80", silent_bg="#173524", audible="#fbbf24", audible_bg="#3a2e12",
+                 loud="#fb923c", loud_bg="#3d2415"),
+}
+
+
+def stylesheet(dark):
+    c = THEMES["dark" if dark else "light"]
+    return """
+QWidget#root {{ background: {bg}; color: {text}; }}
+QLabel {{ color: {text}; background: transparent; }}
+QLabel#muted {{ color: {muted}; }}
+QLabel#title {{ font-size: 15px; font-weight: 600; }}
+QLabel#caption {{ color: {muted}; font-size: 11px; }}
+QLabel#temp {{ font-size: 44px; font-weight: 700; }}
+QLabel#footer {{ color: {muted}; font-size: 11px; }}
+QLabel#msg {{ color: {muted}; }}
+QFrame#card {{ background: {card}; border: 1px solid {border}; border-radius: 12px; }}
+QLabel#chip {{ border-radius: 11px; padding: 3px 12px; font-weight: 600; }}
+QLabel#chip[level="silent"] {{ background: {silent_bg}; color: {silent}; }}
+QLabel#chip[level="audible"] {{ background: {audible_bg}; color: {audible}; }}
+QLabel#chip[level="loud"] {{ background: {loud_bg}; color: {loud}; }}
+QPushButton, QToolButton, QComboBox {{
+    background: {field}; color: {text}; border: 1px solid {border};
+    border-radius: 8px; padding: 6px 12px; min-height: 18px;
+}}
+QPushButton:hover, QToolButton:hover, QComboBox:hover {{ background: {hover}; }}
+QPushButton:disabled, QComboBox:disabled {{ color: {muted}; }}
+QToolButton::menu-indicator {{ image: none; width: 0px; }}
+QPushButton#primary {{ background: {accent}; color: {accent_text}; border: none; font-weight: 600; }}
+QPushButton#primary:disabled {{ background: {border}; color: {muted}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox QAbstractItemView {{
+    background: {card}; color: {text}; border: 1px solid {border};
+    selection-background-color: {accent}; selection-color: {accent_text}; outline: 0;
+}}
+QMenu {{ background: {card}; color: {text}; border: 1px solid {border}; border-radius: 8px; padding: 4px; }}
+QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
+QMenu::item:selected {{ background: {accent}; color: {accent_text}; }}
+QInputDialog, QMessageBox {{ background: {card}; color: {text}; }}
+""".format(**c)
 
 
 def read_temp():
@@ -342,17 +380,29 @@ class CurveWidget(QFrame):
 class MainWin(QWidget):
     def __init__(self):
         super().__init__()
+        self.setObjectName("root")
         self.setWindowTitle("MS S1 Max fans control")
         if os.path.exists(ICON):
             self.setWindowIcon(QIcon(ICON))
-        self.setMinimumSize(600, 520)
-        self.resize(680, 600)
+        self.setMinimumSize(640, 600)
+        self.resize(720, 680)
         self.profiles = load_profiles()
         self.custom = False
+        self.dark = False
+        self.proc = None
+        self.pending = None
+        self.ok_text = ""
+        self.temp = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 14)
+        root.setSpacing(12)
 
-        top = QHBoxLayout(); top.addStretch()
+        # top bar: title and the three controls
+        top = QHBoxLayout(); top.setSpacing(8)
+        title = QLabel("MS-S1 MAX · " + ("Controllo ventole" if CUR_LANG == "it" else "Fan control"))
+        title.setObjectName("title")
+        top.addWidget(title); top.addStretch()
         self.settings_btn = QToolButton(); self.settings_btn.setText(t("settings"))
         self.settings_btn.setPopupMode(QToolButton.InstantPopup)
         self.settings_menu = QMenu(self.settings_btn)
@@ -370,40 +420,56 @@ class MainWin(QWidget):
         self.lang.currentIndexChanged.connect(self.on_lang); top.addWidget(self.lang)
         root.addLayout(top)
 
-        head = QHBoxLayout()
-        self.temp_lbl = QLabel("-- °C"); tf = QFont(); tf.setPointSize(34); tf.setBold(True); self.temp_lbl.setFont(tf)
-        head.addWidget(self.temp_lbl)
-        c = QVBoxLayout()
-        self.status_lbl = QLabel("—"); sf = QFont(); sf.setPointSize(13); sf.setBold(True); self.status_lbl.setFont(sf)
-        self.head_lbl = QLabel(""); hf = QFont(); hf.setPointSize(11); self.head_lbl.setFont(hf)
-        c.addStretch(); c.addWidget(self.status_lbl); c.addWidget(self.head_lbl); c.addStretch()
-        head.addLayout(c); head.addStretch(); root.addLayout(head)
+        # status card: temperature, level chip, what happens next
+        hero = QFrame(); hero.setObjectName("card")
+        hl = QHBoxLayout(hero); hl.setContentsMargins(20, 16, 20, 16); hl.setSpacing(18)
+        tcol = QVBoxLayout(); tcol.setSpacing(0)
+        self.temp_lbl = QLabel("-- °C"); self.temp_lbl.setObjectName("temp")
+        cap = QLabel("CPU · Tctl"); cap.setObjectName("caption")
+        tcol.addWidget(self.temp_lbl); tcol.addWidget(cap)
+        hl.addLayout(tcol)
+        scol = QVBoxLayout(); scol.setSpacing(6)
+        self.status_lbl = QLabel("—"); self.status_lbl.setObjectName("chip")
+        self.status_lbl.setProperty("level", "")
+        self.head_lbl = QLabel(""); self.head_lbl.setObjectName("muted")
+        self.sub_lbl = QLabel(""); self.sub_lbl.setObjectName("caption")
+        scol.addStretch(); scol.addWidget(self.status_lbl, 0, Qt.AlignLeft)
+        scol.addWidget(self.head_lbl); scol.addWidget(self.sub_lbl); scol.addStretch()
+        hl.addLayout(scol, 1)
+        root.addWidget(hero)
 
-        self.sub_lbl = QLabel(""); self.sub_lbl.setStyleSheet("color: gray;"); root.addWidget(self.sub_lbl)
-        self.msg_lbl = QLabel(""); root.addWidget(self.msg_lbl)
-        self.proc = None
-        self.pending = None
-        self.ok_text = ""
-
-        selrow = QHBoxLayout()
+        # controls card: profile choice and apply
+        ctl = QFrame(); ctl.setObjectName("card")
+        cl = QVBoxLayout(ctl); cl.setContentsMargins(20, 14, 20, 14); cl.setSpacing(8)
+        selrow = QHBoxLayout(); selrow.setSpacing(10)
         self.prof_cap = QLabel(t("profile")); selrow.addWidget(self.prof_cap)
         self.combo = QComboBox()
         for n in ["ultrasilenzioso", "silenzioso", "leggero", "bilanciato", "aggressivo", "stock"]:
             if n in self.profiles:
                 self.combo.addItem(n)
         self.combo.currentTextChanged.connect(self.on_select); selrow.addWidget(self.combo, 1)
-        self.apply_btn = QPushButton(t("apply")); self.apply_btn.clicked.connect(self.on_apply); selrow.addWidget(self.apply_btn)
+        self.apply_btn = QPushButton(t("apply")); self.apply_btn.setObjectName("primary")
+        self.apply_btn.clicked.connect(self.on_apply); selrow.addWidget(self.apply_btn)
         self.apply_btn.setEnabled(bool(self.profiles))
-        root.addLayout(selrow)
-        self.desc_lbl = QLabel(""); self.desc_lbl.setStyleSheet("color: gray;"); root.addWidget(self.desc_lbl)
+        cl.addLayout(selrow)
+        self.desc_lbl = QLabel(""); self.desc_lbl.setObjectName("muted"); cl.addWidget(self.desc_lbl)
+        root.addWidget(ctl)
 
+        # curve card
+        curve_card = QFrame(); curve_card.setObjectName("card")
+        ccl = QVBoxLayout(curve_card); ccl.setContentsMargins(10, 10, 10, 6); ccl.setSpacing(4)
         self.curve = CurveWidget(); self.curve.edited.connect(self.on_edit)
-        root.addWidget(self.curve, 1)
+        ccl.addWidget(self.curve, 1)
+        root.addWidget(curve_card, 1)
 
-        self.footer = QLabel("MS S1 Max fans control v%s — Raimondo Martire" % VERSION)
-        self.footer.setStyleSheet("color: gray; font-size: 10px;"); self.footer.setAlignment(Qt.AlignRight)
-        root.addWidget(self.footer)
+        # footer: feedback on the left, version on the right
+        foot = QHBoxLayout()
+        self.msg_lbl = QLabel(""); self.msg_lbl.setObjectName("msg"); foot.addWidget(self.msg_lbl, 1)
+        self.footer = QLabel("v%s · Raimondo Martire" % VERSION); self.footer.setObjectName("footer")
+        foot.addWidget(self.footer)
+        root.addLayout(foot)
 
+        self.set_busy(False)
         act = active_profile()
         if act and self.combo.findText(act) >= 0:
             self.combo.setCurrentText(act)
@@ -412,7 +478,6 @@ class MainWin(QWidget):
         self.on_select(self.combo.currentText())
 
         self.apply_theme(_cfg.get("theme") == "dark")
-        self.temp = None
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(2000)
         self.refresh()
 
@@ -424,6 +489,9 @@ class MainWin(QWidget):
         global CUR_LANG
         CUR_LANG = self.lang.currentData()
         self.prof_cap.setText(t("profile")); self.apply_btn.setText(t("apply"))
+        self.settings_btn.setText(t("settings"))
+        self.settings_menu.actions()[0].setText(t("scale_item"))
+        self.settings_menu.actions()[1].setText(t("test_item"))
         self.desc_lbl.setText(DESC[CUR_LANG].get(self._cur_name(), ""))
         _cfg["lang"] = CUR_LANG; save_config(_cfg)
         self.refresh()
@@ -433,8 +501,8 @@ class MainWin(QWidget):
         _cfg["theme"] = self.theme.currentData(); save_config(_cfg)
 
     def apply_theme(self, dark):
-        app = QApplication.instance()
-        app.setPalette(dark_palette() if dark else app.style().standardPalette())
+        self.dark = dark
+        QApplication.instance().setStyleSheet(stylesheet(dark))
         self.curve.set_theme(dark)
 
     def _cur_name(self):
@@ -509,13 +577,17 @@ class MainWin(QWidget):
         pts = self.curve.points()
         d = duty_at(pts, temp)
         if d is None:
-            self.status_lbl.setText("—"); self.status_lbl.setStyleSheet("")
+            level, text = "", "—"
         elif d < 20:
-            self.status_lbl.setText(t("silent")); self.status_lbl.setStyleSheet("color:#2e9e4f;")
+            level, text = "silent", t("silent")
         elif d < 50:
-            self.status_lbl.setText(t("audible")); self.status_lbl.setStyleSheet("color:#c79200;")
+            level, text = "audible", t("audible")
         else:
-            self.status_lbl.setText(t("loud")); self.status_lbl.setStyleSheet("color:#d2691e;")
+            level, text = "loud", t("loud")
+        self.status_lbl.setText(text)
+        self.status_lbl.setProperty("level", level)
+        self.status_lbl.style().unpolish(self.status_lbl)
+        self.status_lbl.style().polish(self.status_lbl)
         nl = next_louder(pts, temp)
         if nl:
             dc, at_t, tgt = nl
@@ -526,8 +598,7 @@ class MainWin(QWidget):
             self.head_lbl.setText("")
         act = active_profile()
         shown = (t("custom") if self.custom else (act or t("unknown")))
-        self.sub_lbl.setText(t("hint") + "   ·   " + t("active", p=shown,
-                             d=(("%d%%" % round(d)) if d is not None else "--")))
+        self.sub_lbl.setText(t("active", p=shown, d=(("%d%%" % round(d)) if d is not None else "--")))
 
 
 def main():

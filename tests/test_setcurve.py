@@ -110,7 +110,8 @@ class SetcurveTest(unittest.TestCase):
             f.write("bilanciato\n")
         with self._quiet():
             self.sc.set_scale(48)
-        self.assertEqual(open(self.sc.SCALE_FILE).read().strip(), "48")
+        with open(self.sc.SCALE_FILE) as f:
+            self.assertEqual(f.read().strip(), "48")
         self.assertEqual(record(self._image(), 0x10, 0)[0], round(30 * 48 / 100))
 
     def test_set_scale_rejects_out_of_range(self):
@@ -182,6 +183,70 @@ class SetcurveTest(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.sc.speed_test(80, 5)
         self.assertEqual(self._image(), self.snapshot)
+
+
+class GuardTest(unittest.TestCase):
+    """Board guard and zero-duty refusal, on the command line."""
+
+    setUp = SetcurveTest.setUp
+    _image = SetcurveTest._image
+    _quiet = SetcurveTest._quiet
+
+    def _dmi(self, product, board=""):
+        files = {"/sys/class/dmi/id/product_name": product + "\n",
+                 "/sys/class/dmi/id/board_name": board + "\n"}
+
+        def fake_open(path, *a, **k):
+            if path in files:
+                import io
+                return io.StringIO(files[path])
+            raise OSError(2, "no such file")
+        return mock.patch.object(self.sc, "open", side_effect=fake_open, create=True)
+
+    def test_board_check_accepts_ms_s1(self):
+        with self._dmi("MS-S1 MAX"):
+            self.sc.board_check(force=False)              # no exception
+
+    def test_board_check_refuses_other_boards(self):
+        with self._dmi("UM790 Pro", "F7BSC"):
+            with self.assertRaises(SystemExit) as cm:
+                self.sc.board_check(force=False)
+        self.assertIn("--force", str(cm.exception))
+
+    def test_board_check_refuses_when_dmi_unreadable(self):
+        with self._dmi("", ""):
+            with self.assertRaises(SystemExit):
+                self.sc.board_check(force=False)
+
+    def test_force_bypasses_board_check(self):
+        with self._dmi("UM790 Pro"):
+            self.sc.board_check(force=True)
+
+    def _run(self, *argv):
+        with mock.patch.object(self.sc.sys, "argv", ["strixec-setcurve"] + list(argv)), self._quiet():
+            return self.sc.main()
+
+    def test_custom_zero_duty_refused_without_allow_off(self):
+        with self._dmi("MS-S1 MAX"):
+            with self.assertRaises(SystemExit) as cm:
+                self._run("custom", "40:0,50:10,60:20,70:30,80:40,90:50,97:60")
+        self.assertIn("--allow-off", str(cm.exception))
+
+    def test_test_zero_percent_refused_without_allow_off(self):
+        with self._dmi("MS-S1 MAX"):
+            with self.assertRaises(SystemExit):
+                self._run("test", "0", "5")
+
+    def test_write_refused_on_unknown_board(self):
+        with self._dmi("UM790 Pro"):
+            with self.assertRaises(SystemExit) as cm:
+                self._run("silenzioso")
+        self.assertIn("MS-S1", str(cm.exception))
+        self.assertEqual(self._image(), self.snapshot)            # nothing written
+
+    def test_reads_do_not_need_the_board(self):
+        with self._dmi("UM790 Pro"):
+            self._run("dump-profiles")                            # no exception
 
 
 if __name__ == "__main__":

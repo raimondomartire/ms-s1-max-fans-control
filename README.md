@@ -86,6 +86,22 @@ Profiles:
 To make a profile the boot default, edit `ExecStart` in
 `/etc/systemd/system/strixec-curve.service`.
 
+Other commands:
+
+```bash
+sudo strixec-setcurve custom 55:6,68:10,78:15,84:24,89:42,93:70,97:100  # your own curve, percent
+sudo strixec-setcurve set-scale 48  # raw value for full speed (default 100; 48 is under test)
+sudo strixec-setcurve test 50 30    # hold 50 % for 30 s, then restore the previous curve
+```
+
+### Safety
+
+- Writes are refused unless the DMI product or board name contains `MS-S1`.
+  `--force` overrides this. Use it only on a board you have checked yourself.
+- A 0 % duty stops the fans. It is refused unless you pass `--allow-off`.
+- The table is kept on the EC, so the fans keep the last curve with no daemon
+  running. Use `sudo strixec-setcurve stock` to return to the factory curve.
+
 ### GUI
 
 Launch **MS S1 Max fans control** from the application menu, or run

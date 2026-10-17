@@ -74,7 +74,8 @@ def ec_read(off):
 
 def get_scale():
     try:
-        v = int(open(SCALE_FILE).read().strip())
+        with open(SCALE_FILE) as f:
+            v = int(f.read().strip())
         if SCALE_MIN <= v <= SCALE_MAX:
             return v
     except (OSError, ValueError):
@@ -189,7 +190,8 @@ def set_scale(value):
     print("fan scale set to %d (raw value for full speed)." % value)
     # Re-apply the active profile so the table matches the new scale.
     try:
-        active = open(STATE).read().strip()
+        with open(STATE) as f:
+            active = f.read().strip()
     except OSError:
         active = ""
     if active in PROFILES:
@@ -262,36 +264,72 @@ def dump_profiles():
     print(json.dumps({"scale": scale, "profiles": out}))
 
 
+FORCE_FLAG = "--force"          # write even if the board is not recognised
+ALLOW_OFF_FLAG = "--allow-off"  # allow a 0 % duty (fans can stop)
+# Substring of the DMI product or board name of the MS-S1 MAX. Not yet checked
+# against the exact string of every BIOS revision: confirm with
+#   cat /sys/class/dmi/id/product_name /sys/class/dmi/id/board_name
+BOARD_MARKERS = ("MS-S1",)
+
+
+def board_check(force):
+    """Refuse EC writes on a board we have not identified (guard from ec-su_axb35's load check)."""
+    if force:
+        return
+    names = []
+    for f in ("product_name", "board_name"):
+        try:
+            with open("/sys/class/dmi/id/" + f) as fh:
+                names.append(fh.read().strip())
+        except OSError:
+            pass
+    if not any(m in n.upper() for n in names for m in BOARD_MARKERS):
+        raise SystemExit("refusing to write the EC: this is not a recognised MS-S1 MAX (DMI: %s). "
+                         "Use %s only if you are sure." % (", ".join(names) or "unreadable", FORCE_FLAG))
+
+
 def main():
-    if len(sys.argv) < 2:
+    flags = set(x for x in sys.argv[1:] if x.startswith("--"))
+    args = [x for x in sys.argv[1:] if not x.startswith("--")]
+    if not args:
         print(__doc__)
         return
-    a = sys.argv[1]
+    force = FORCE_FLAG in flags
+    allow_off = ALLOW_OFF_FLAG in flags
+    a = args[0]
     if a == "dump-profiles":
         dump_profiles()
     elif a == "show":
         print("fan scale: %d" % get_scale())
         show()
     elif a == "custom":
-        if len(sys.argv) < 3:
+        if len(args) < 2:
             print("usage: strixec-setcurve custom T1:P1,T2:P2,... (%d points, percent 0..100)" % NREC)
             sys.exit(1)
-        pts = parse_points(sys.argv[2])
+        pts = parse_points(args[1])
         if len(pts) != NREC or any(not (0 <= d <= 100) for _, d in pts):
             raise SystemExit("custom needs %d points with percent 0..100" % NREC)
+        if not allow_off and any(d == 0 for _, d in pts):
+            raise SystemExit("a 0 %% duty stops the fans; use %s to allow it" % ALLOW_OFF_FLAG)
+        board_check(force)
         apply_points(pts, "personalizzato")
     elif a == "set-scale":
-        if len(sys.argv) < 3:
+        if len(args) < 2:
             raise SystemExit("usage: strixec-setcurve set-scale N   (N = %d..%d)" % (SCALE_MIN, SCALE_MAX))
-        set_scale(int(sys.argv[2]))
+        board_check(force)
+        set_scale(int(args[1]))
     elif a == "test":
-        if len(sys.argv) < 4:
+        if len(args) < 3:
             raise SystemExit("usage: strixec-setcurve test PERCENT SECONDS")
-        pct, secs = int(sys.argv[2]), int(sys.argv[3])
+        pct, secs = int(args[1]), int(args[2])
         if not (0 <= pct <= 100) or not (1 <= secs <= 120):
             raise SystemExit("test needs percent 0..100 and 1..120 seconds")
+        if pct == 0 and not allow_off:
+            raise SystemExit("a 0 %% test stops the fans; use %s to allow it" % ALLOW_OFF_FLAG)
+        board_check(force)
         speed_test(pct, secs)
     elif a in NAMED:
+        board_check(force)
         apply_profile(a)
     else:
         print("unknown profile: %s (use: %s, custom, set-scale, test, show)" % (a, ", ".join(NAMED)))
