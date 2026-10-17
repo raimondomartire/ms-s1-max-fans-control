@@ -13,8 +13,8 @@ kernel 7.1.x. All offsets are in the 0x00–0xFF EC RAM space accessed through
 | Offset | Meaning                                  | Notes                          |
 |--------|------------------------------------------|--------------------------------|
 | `0x09` | CPU temperature (°C), tracks `Tctl`      | Read-only; matches `k10temp`   |
-| `0x11` | **Fan 1 curve table** (base)             | 8 × 3-byte records             |
-| `0x31` | **Fan 2 curve table** (base)             | identical structure            |
+| `0x10` | **Fan 1 curve table** (base)             | 8 × 3-byte records             |
+| `0x30` | **Fan 2 curve table** (base)             | identical structure            |
 
 No readable fan tachometer (RPM) was found, and no live "manual duty" register:
 under load only `0x09` changes. Fan speed is governed entirely by the curve
@@ -22,42 +22,53 @@ tables, which the firmware reads **live**.
 
 ## Fan-curve table format
 
-Each fan table is **7 records of 3 bytes** (fan1 `0x11`–`0x25`, fan2
-`0x31`–`0x45`):
+Confirmed by James's alignment experiment (2026-10-16, `plan-hwmon.md`, Phase 0
+step 7). Each fan table is **8 records of 3 bytes** (fan 1 `0x10`–`0x27`, fan 2
+`0x30`–`0x47`):
 
 ```
-record i (i = 0..6), base = 0x11 (fan1) / 0x31 (fan2):
-  base + 3*i + 0 : upper temperature of the band (°C)
-  base + 3*i + 1 : lower bound / hysteresis (°C) = previous record's upper temp
-  base + 3*i + 2 : duty (%) for the band (lower, upper]
+record k (k = 0..7), base = 0x10 (fan 1) / 0x30 (fan 2):
+  base + 3*k + 0 : value for the band (lower, upper]  (raw; see the scale below)
+  base + 3*k + 1 : upper temperature of the band (°C)
+  base + 3*k + 2 : lower temperature of the band (°C)
 ```
 
-A record's duty applies for temperatures up to its `upper` value (and above the
-previous record's `upper`). Above the last record's temperature the firmware
-holds the last band's duty, so the last duty should be 100 %.
+Record 0 covers everything up to its upper bound, so below the first temperature
+the fans get record 0's value. Stock uses 0 there, which stops the fans below
+25 °C. The last record's value holds above its upper bound.
 
-> Offsets `0x26`/`0x27`/`0x28` (and `0x46`–`0x48`) are **not** part of the
-> writable curve table: `0x28`/`0x48` are volatile (firmware-updated) and must
-> not be used as curve bytes.
+> The earlier model (7 records from `0x11`, `[upper, lower, value]`) was off by
+> one byte: each value was written into the band above. Its claim that `0x26`–
+> `0x28` are not writable was also wrong: `0x26`/`0x27` are record 7's upper and
+> lower. `0x28`/`0x48` are volatile (firmware-updated) and are not curve bytes.
 
-`duty` is a raw EC value. The default fan scale is `100` (raw value for full
-speed), which keeps the profiles as written. A scale of `48` (about 4800 RPM at
-RPM/100 units) is a hypothesis from acoustic measurements that rise with the
-value up to ~48 and then flatten; it is **not** tachometer-verified. Set it with
-`strixec-setcurve set-scale 48` (stored in `/etc/strixec/fan-scale`). The tools
-write only the **temperature** and **duty** columns. `strixec-setcurve test P S`
-holds P % of full speed for S seconds and then restores the previous table.
+### Duty scale
+
+The raw value that means full speed is the fan scale. Default `100`, stored in
+`/etc/strixec/fan-scale`. Set with `strixec-setcurve set-scale N`.
+
+James's measurements put the knee at **48**: the fans stop getting faster above
+it. A rotation tone measured at each step gives about 98 RPM per unit, so the
+value is RPM/100 and 48 is about 4700 RPM. This is strong evidence but not a
+tachometer reading. Until it is confirmed, `set-scale 48` is the tested option.
+
+The fans were run down to value 9 without stalling; stall from standstill is not
+tested. `strixec-setcurve` never writes a non-zero duty below 9.
+
+`strixec-setcurve test P S` holds P % of full speed for S seconds and then
+restores the previous table.
 
 ### Factory (stock) curve
 
-Raw values (independent of the scale setting):
+Records as `value (upper, lower]`, from `ec-stock.txt` in James's experiments:
 
-```
-25°C→16  45°C→18  60°C→25  72°C→29  83°C→34  88°C→36  93°C→40  98°C→(max)
-```
+| Band, °C | ≤ 25 | 25–45 | 45–60 | 60–72 | 72–83 | 83–88 | 88–93 | 93–95 (lower 90) |
+|---|---|---|---|---|---|---|---|---|
+| Value | 0 | 16 | 18 | 25 | 29 | 34 | 36 | 40 |
+| % of 48 | 0 | 33 | 38 | 52 | 60 | 71 | 75 | 83 |
 
-The stock curve reaches only 40 (40 % at scale 100, ~83 % at scale 48) near 93 °C, which is why the APU throttles
-under sustained load.
+The stock curve reaches 40 of 48 (83 %) near 93 °C, which is why the APU
+throttles under sustained load.
 
 ## Platform notes (Fedora + Secure Boot)
 

@@ -3,19 +3,21 @@
 strixec-setcurve - write a fan curve into the Minisforum MS-S1 MAX EC table
 via /dev/strixec. The firmware reads this table live.
 
-EC table (reverse-engineered on this machine):
-  Fan1 base 0x11 | Fan2 base 0x31
-  7 records of 3 bytes each:
-    base + 3*i + 0 : upper temperature of the band (°C)
-    base + 3*i + 1 : lower bound / hysteresis (°C) = previous band's upper temp
-    base + 3*i + 2 : raw duty value applied in the band (lower, upper]
-  So a record's duty applies for temperatures up to its 'upper' value (and above
-  the previous record's 'upper'). All three columns are written consistently.
+EC table (confirmed by the alignment experiment, 2026-10-16):
+  Fan1 base 0x10 | Fan2 base 0x30
+  8 records of 3 bytes each, record k at base + 3*k:
+    base + 3*k + 0 : raw duty value for the band (lower, upper]
+    base + 3*k + 1 : upper temperature of the band (°C)
+    base + 3*k + 2 : lower temperature of the band (°C)
+  Record 0 covers everything up to its upper bound, so it must never be 0 on a
+  curve that should keep the fans running (stock uses 0 there: fans off below 25 °C).
 
 Duty scale: the raw value that means full speed is the "fan scale" (default 100,
 stored in /etc/strixec/fan-scale). Profiles are written as a percentage of that
-scale. 48 is a working hypothesis (about 4800 RPM at RPM/100 units, from acoustic
-measurements; not tachometer-verified): set it with `set-scale 48` to test it.
+scale. Measurements by James (plan-hwmon.md, Phase 0) put the knee at 48: the raw
+value is RPM/100 and full speed is about 4800 RPM. Use `set-scale 48` to act on it.
+Non-zero profile values are never below MIN_RAW (9), the lowest speed the fans
+were run at without stalling (not yet tested from standstill).
 
 Usage:
   sudo strixec-setcurve <profile>        # ultrasilenzioso|silenzioso|leggero|bilanciato|aggressivo|stock
@@ -28,12 +30,14 @@ Usage:
 import sys, os, json, signal, time
 
 DEV = "/dev/strixec"
-FAN_BASES = [0x11, 0x31]          # fan1, fan2
+FAN_BASES = [0x10, 0x30]          # fan1, fan2
 STATE = "/run/strixec/profile"
 SCALE_FILE = "/etc/strixec/fan-scale"
 DEFAULT_SCALE = 100
 SCALE_MIN, SCALE_MAX = 10, 255
-NREC = 7
+NREC = 7                 # points in a profile (one per band boundary)
+NREC_EC = 8              # records the EC holds per fan
+MIN_RAW = 9              # lowest raw value used for a non-zero duty (tested spinning)
 
 # profile -> 7 (upper_temp_C, percent of full speed); the percent applies for band up to that temp.
 # Above the last record's temperature the firmware holds the last band's duty.
@@ -49,8 +53,10 @@ PROFILES = {
     "aggressivo":      [(40, 45), (50, 60), (58, 75), (66, 88),
                         (74, 100), (84, 100), (94, 100)],
 }
-# "stock" is the factory bytes read from this machine, written raw whatever the scale.
-STOCK = [(25, 16), (45, 18), (60, 25), (72, 29), (83, 34), (88, 36), (93, 40)]
+# "stock" is the factory table read from this machine, written raw whatever the scale.
+# Records as (value, upper, lower), from the alignment experiment (plan-hwmon.md, Phase 0 step 7).
+STOCK = [(0, 25, 0), (16, 45, 25), (18, 60, 45), (25, 72, 60),
+         (29, 83, 72), (34, 88, 83), (36, 93, 88), (40, 95, 90)]
 NAMED = list(PROFILES) + ["stock"]
 
 
@@ -80,10 +86,22 @@ def to_raw(pct, scale):
     return max(0, min(scale, int(round(pct * scale / 100.0))))
 
 
+def to_raw_points(pct_pts, scale):
+    """Percent points -> raw points, never below MIN_RAW unless the duty is 0."""
+    out = []
+    for t, d in pct_pts:
+        raw = to_raw(d, scale)
+        if d > 0:
+            raw = max(MIN_RAW, raw)
+        out.append((t, raw))
+    return out
+
+
 def profile_raw(name, scale):
+    """Raw points for a named profile (7 points)."""
     if name == "stock":
         return list(STOCK)
-    return [(t, to_raw(d, scale)) for t, d in PROFILES[name]]
+    return to_raw_points(PROFILES[name], scale)
 
 
 def _validate_raw(pts):
@@ -92,30 +110,43 @@ def _validate_raw(pts):
     prev_t = -1
     for t, d in pts:
         if not (0 <= t <= 120) or not (0 <= d <= 255):
-            raise SystemExit("point out of range (temp 0..120): %r" % ((t, d),))
+            raise SystemExit("point out of range (temp 0..120, duty 0..255): %r" % ((t, d),))
         if t <= prev_t:
             raise SystemExit("temperatures must be strictly increasing")
         prev_t = t
 
 
-def _table_offsets():
-    return [base + k for base in FAN_BASES for k in range(3 * NREC)]
-
-
-def _write_table(pts):
-    """Write raw points to both fans. On a failed write, restore the previous bytes."""
+def points_to_records(pts):
+    """7 (temp, duty) points -> 8 (value, upper, lower) records.
+    Band k is (previous upper, upper] with the duty of point k; band 0 starts at 0.
+    The last point's duty also holds above its temperature (record 7, up to 100 °C)."""
     _validate_raw(pts)
+    recs = []
+    prev = 0
+    for t, d in pts:
+        recs.append((int(d), int(t), prev))
+        prev = int(t)
+    recs.append((int(pts[-1][1]), 100, prev))
+    return recs
+
+
+def _table_offsets():
+    return [base + k for base in FAN_BASES for k in range(3 * NREC_EC)]
+
+
+def _write_table(recs):
+    """Write 8 (value, upper, lower) records to both fans. On a failed write, restore the previous bytes."""
+    if len(recs) != NREC_EC:
+        raise SystemExit("table must have %d records" % NREC_EC)
     # Snapshot the live table first: the firmware reads it at any moment, so a
     # write that fails half-way must not leave a mixed curve behind.
     saved = [(off, ec_read(off)) for off in _table_offsets()]
     try:
         for base in FAN_BASES:
-            prev = 0
-            for i, (t, d) in enumerate(pts):
-                ec_write(base + 3 * i + 0, int(t))    # upper temp
-                ec_write(base + 3 * i + 1, prev)      # hysteresis = previous upper
-                ec_write(base + 3 * i + 2, int(d))    # duty
-                prev = int(t)
+            for k, (value, upper, lower) in enumerate(recs):
+                ec_write(base + 3 * k + 0, int(value))
+                ec_write(base + 3 * k + 1, int(upper))
+                ec_write(base + 3 * k + 2, int(lower))
     except OSError as e:
         restore_bytes(saved)
         raise SystemExit("write failed (%s): previous curve restored, nothing applied" % e)
@@ -132,8 +163,7 @@ def restore_bytes(saved):
 def apply_points(pts_pct, name):
     """Apply a curve given in percent of full speed."""
     scale = get_scale()
-    raw = [(t, to_raw(d, scale)) for t, d in pts_pct]
-    _write_table(raw)
+    _write_table(points_to_records(to_raw_points(pts_pct, scale)))
     _write_state(name)
     print("curve '%s' applied (scale %d) to fan1(0x%02X) + fan2(0x%02X)." % (name, scale, FAN_BASES[0], FAN_BASES[1]))
     show()
@@ -169,7 +199,7 @@ def set_scale(value):
 def speed_test(pct, seconds):
     """Hold a fixed fan speed for `seconds`, then put the previous table back."""
     scale = get_scale()
-    raw = to_raw(pct, scale)
+    raw = to_raw(pct, scale) if pct == 0 else max(MIN_RAW, to_raw(pct, scale))
     saved = [(off, ec_read(off)) for off in _table_offsets()]
     flat = [(t, raw) for t in (40, 50, 60, 70, 80, 90, 97)]
 
@@ -178,7 +208,7 @@ def speed_test(pct, seconds):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        _write_table(flat)
+        _write_table(points_to_records(flat))
         print("holding %d%% (raw %d of %d) for %d s, then restoring the previous curve." % (pct, raw, scale, seconds))
         sys.stdout.flush()
         time.sleep(seconds)
@@ -212,11 +242,11 @@ def _write_state(name):
 def show():
     for base in FAN_BASES:
         cells = []
-        for i in range(NREC):
-            t = ec_read(base + 3 * i + 0)
-            h = ec_read(base + 3 * i + 1)
-            d = ec_read(base + 3 * i + 2)
-            cells.append("(%d-%d]->%d" % (h, t, d))
+        for k in range(NREC_EC):
+            v = ec_read(base + 3 * k + 0)
+            u = ec_read(base + 3 * k + 1)
+            l = ec_read(base + 3 * k + 2)
+            cells.append("(%d-%d]->%d" % (l, u, v))
         print("  fan@0x%02X: %s" % (base, "  ".join(cells)))
 
 
@@ -225,7 +255,8 @@ def dump_profiles():
     out = {}
     for name in NAMED:
         if name == "stock":
-            out[name] = [[t, round(d * 100.0 / scale, 1)] for t, d in STOCK]
+            # display: (upper temp, duty as % of full speed) for the 7 bands above the first record
+            out[name] = [[u, round(v * 100.0 / scale, 1)] for v, u, _ in STOCK[1:]]
         else:
             out[name] = [[t, d] for t, d in PROFILES[name]]
     print(json.dumps({"scale": scale, "profiles": out}))

@@ -21,6 +21,11 @@ def load_setcurve():
     return mod
 
 
+def record(img, base, k):
+    o = base + 3 * k
+    return img[o], img[o + 1], img[o + 2]          # (value, upper, lower)
+
+
 class SetcurveTest(unittest.TestCase):
     def setUp(self):
         self.sc = load_setcurve()
@@ -41,16 +46,39 @@ class SetcurveTest(unittest.TestCase):
     def _quiet(self):
         return mock.patch("builtins.print")
 
-    # --- scale ---------------------------------------------------------------
+    # --- layout (James's alignment experiment) ---------------------------------
 
-    def test_default_scale_writes_percent_values_unchanged(self):
+    def test_stock_table_decodes_to_james_values(self):
+        with self._quiet():
+            self.sc.apply_profile("stock")
+        img = self._image()
+        for base in self.sc.FAN_BASES:
+            self.assertEqual([record(img, base, k) for k in range(8)], self.sc.STOCK)
+        self.assertEqual(record(img, 0x10, 7), (40, 95, 90))   # record 7 at 0x25..0x27
+
+    def test_record_zero_is_never_zero_for_a_profile(self):
+        for name in self.sc.PROFILES:
+            for scale in (48, 100):
+                recs = self.sc.points_to_records(self.sc.profile_raw(name, scale))
+                self.assertGreater(recs[0][0], 0, (name, scale))
+
+    def test_profile_records_sit_at_0x10_and_0x30(self):
         with self._quiet():
             self.sc.apply_profile("silenzioso")
         img = self._image()
+        recs = self.sc.points_to_records(self.sc.profile_raw("silenzioso", 100))
         for base in self.sc.FAN_BASES:
-            for i, (t, d) in enumerate(self.sc.PROFILES["silenzioso"]):
-                self.assertEqual(img[base + 3 * i], t)
-                self.assertEqual(img[base + 3 * i + 2], d)
+            self.assertEqual([record(img, base, k) for k in range(8)], recs)
+
+    def test_below_first_temperature_gets_a_running_speed(self):
+        with self._quiet():
+            self.sc.apply_profile("ultrasilenzioso")
+        img = self._image()
+        value, upper, lower = record(img, 0x10, 0)
+        self.assertEqual((lower, upper), (0, 55))
+        self.assertGreaterEqual(value, self.sc.MIN_RAW)
+
+    # --- scale ---------------------------------------------------------------
 
     def test_scale_48_maps_percent_to_raw(self):
         with open(self.sc.SCALE_FILE, "w") as f:
@@ -60,8 +88,9 @@ class SetcurveTest(unittest.TestCase):
             self.sc.apply_profile("aggressivo")
         img = self._image()
         for i, (t, d) in enumerate(self.sc.PROFILES["aggressivo"]):
-            self.assertEqual(img[0x11 + 3 * i + 2], round(d * 48 / 100))
-            self.assertTrue(img[0x11 + 3 * i + 2] <= 48)
+            value = record(img, 0x10, i)[0]
+            self.assertEqual(value, max(self.sc.MIN_RAW, round(d * 48 / 100)))
+            self.assertLessEqual(value, 48)
 
     def test_stock_is_raw_whatever_the_scale(self):
         with open(self.sc.SCALE_FILE, "w") as f:
@@ -69,8 +98,7 @@ class SetcurveTest(unittest.TestCase):
         with self._quiet():
             self.sc.apply_profile("stock")
         img = self._image()
-        for i, (t, d) in enumerate(self.sc.STOCK):
-            self.assertEqual((img[0x11 + 3 * i], img[0x11 + 3 * i + 2]), (t, d))
+        self.assertEqual(record(img, 0x10, 1), (16, 45, 25))
 
     def test_bad_scale_file_falls_back_to_default(self):
         with open(self.sc.SCALE_FILE, "w") as f:
@@ -83,8 +111,7 @@ class SetcurveTest(unittest.TestCase):
         with self._quiet():
             self.sc.set_scale(48)
         self.assertEqual(open(self.sc.SCALE_FILE).read().strip(), "48")
-        img = self._image()
-        self.assertEqual(img[0x11 + 2], round(30 * 48 / 100))   # first band of "bilanciato"
+        self.assertEqual(record(self._image(), 0x10, 0)[0], round(30 * 48 / 100))
 
     def test_set_scale_rejects_out_of_range(self):
         with self.assertRaises(SystemExit):
@@ -94,8 +121,12 @@ class SetcurveTest(unittest.TestCase):
 
     def test_profiles_fit_the_scale(self):
         for name in self.sc.PROFILES:
-            for d in (d for _, d in self.sc.profile_raw(name, 48)):
+            for _, d in self.sc.profile_raw(name, 48):
                 self.assertTrue(0 <= d <= 48, (name, d))
+
+    def test_small_duty_is_raised_to_the_tested_minimum(self):
+        self.assertEqual(self.sc.to_raw_points([(50, 1)], 100), [(50, self.sc.MIN_RAW)])
+        self.assertEqual(self.sc.to_raw_points([(50, 0)], 100), [(50, 0)])
 
     def test_raw_points_validation(self):
         with self.assertRaises(SystemExit):
@@ -139,7 +170,8 @@ class SetcurveTest(unittest.TestCase):
         with mock.patch.object(self.sc.time, "sleep", side_effect=fake_sleep), self._quiet():
             self.sc.speed_test(50, 5)
         self.assertEqual(seen["secs"], 5)
-        self.assertEqual(seen["during"][0x11 + 2], 50)      # 50 % at scale 100 -> raw 50
+        self.assertEqual(record(seen["during"], 0x10, 0)[0], 50)        # 50 % at scale 100 -> raw 50
+        self.assertEqual(record(seen["during"], 0x10, 7)[0], 50)        # flat: last record too
         self.assertEqual(self._image(), self.snapshot)
 
     def test_speed_test_restores_even_if_interrupted(self):

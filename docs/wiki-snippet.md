@@ -13,7 +13,7 @@ Open-source tool for this board:
 — a small signed kernel module exposes the EC as `/dev/strixec` (works under
 Secure Boot + SELinux), with CLI/GUI fan-curve profiles and systemd persistence.
 
-Reverse-engineered EC map: CPU temperature at `0x09`; fan-curve tables at `0x11`
-(fan 1) and `0x31` (fan 2), 8 × 3-byte records `[temp, hysteresis, duty%]`, read
-live by the firmware. Note: this board is **not** a Sixunited AXB35-02 (different
-EC layout). Full details in the repo's `docs/EC-MAP.md`.
+Reverse-engineered EC map: CPU temperature at `0x09`; fan-curve tables at `0x10`
+(fan 1) and `0x30` (fan 2), 8 × 3-byte records `[value, upper, lower]`, read
+live by the firmware. The full scale is about 48 (RPM/100), per the acoustic
+and rotation-tone measurements. Full details in the repo's `docs/EC-MAP.md`.
