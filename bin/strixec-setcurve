@@ -41,22 +41,29 @@ MIN_RAW = 9              # lowest raw value used for a non-zero duty (tested spi
 
 # profile -> 7 (upper_temp_C, percent of full speed); the percent applies for band up to that temp.
 # Above the last record's temperature the firmware holds the last band's duty.
+# Last temperature of every profile is PROTECT_LOWER (90 °C) or below.
 PROFILES = {
-    "ultrasilenzioso": [(55, 6),  (68, 10), (78, 15), (84, 24),
-                        (89, 42), (93, 70), (97, 100)],
-    "silenzioso":      [(50, 12), (62, 20), (72, 28), (80, 42),
-                        (86, 60), (92, 85), (97, 100)],
-    "leggero":         [(48, 20), (58, 32), (68, 45), (78, 62),
-                        (85, 80), (91, 95), (96, 100)],
-    "bilanciato":      [(45, 30), (56, 45), (66, 60), (74, 75),
-                        (82, 90), (89, 100), (95, 100)],
-    "aggressivo":      [(40, 45), (50, 60), (58, 75), (66, 88),
-                        (74, 100), (84, 100), (94, 100)],
+    "ultrasilenzioso": [(55, 6),  (67, 10), (75, 15), (80, 24),
+                        (84, 42), (87, 70), (90, 100)],
+    "silenzioso":      [(50, 12), (60, 20), (68, 28), (76, 42),
+                        (82, 60), (86, 85), (90, 100)],
+    "leggero":         [(48, 20), (56, 32), (64, 45), (72, 62),
+                        (80, 80), (85, 95), (90, 100)],
+    "bilanciato":      [(45, 30), (54, 45), (62, 60), (70, 75),
+                        (78, 90), (85, 100), (90, 100)],
+    "aggressivo":      [(40, 45), (48, 60), (55, 75), (62, 88),
+                        (70, 100), (80, 100), (90, 100)],
 }
 # "stock" is the factory table read from this machine, written raw whatever the scale.
 # Records as (value, upper, lower), from the alignment experiment (plan-hwmon.md, Phase 0 step 7).
 STOCK = [(0, 25, 0), (16, 45, 25), (18, 60, 45), (25, 72, 60),
          (29, 83, 72), (34, 88, 83), (36, 93, 88), (40, 95, 90)]
+# Record 7 is treated as the firmware's protection band (decision, plan-hwmon.md Phase 0 step 7):
+# its bounds stay at the stock 90-95 °C, its value is never lowered below the stock 40,
+# and profiles end at 90 °C so that record 6 stops where record 7 starts.
+PROTECT_VALUE_MIN = STOCK[7][0]
+PROTECT_UPPER = STOCK[7][1]
+PROTECT_LOWER = STOCK[7][2]
 NAMED = list(PROFILES) + ["stock"]
 
 
@@ -115,19 +122,24 @@ def _validate_raw(pts):
         if t <= prev_t:
             raise SystemExit("temperatures must be strictly increasing")
         prev_t = t
+    if pts[-1][0] > PROTECT_LOWER:
+        raise SystemExit("the last temperature must be %d °C or less (record 7 is the protection band)"
+                         % PROTECT_LOWER)
 
 
 def points_to_records(pts):
     """7 (temp, duty) points -> 8 (value, upper, lower) records.
-    Band k is (previous upper, upper] with the duty of point k; band 0 starts at 0.
-    The last point's duty also holds above its temperature (record 7, up to 100 °C)."""
+    Records 0-6: band k is (previous upper, upper] with the duty of point k; band 0 starts at 0.
+    Record 7 is the protection band: bounds stay at the stock 90-95 °C, and its value is the
+    last duty if that is higher than the stock value, never lower."""
     _validate_raw(pts)
     recs = []
     prev = 0
     for t, d in pts:
         recs.append((int(d), int(t), prev))
         prev = int(t)
-    recs.append((int(pts[-1][1]), 100, prev))
+    protect_value = max(PROTECT_VALUE_MIN, int(pts[-1][1]))
+    recs.append((protect_value, PROTECT_UPPER, PROTECT_LOWER))
     return recs
 
 
@@ -203,7 +215,7 @@ def speed_test(pct, seconds):
     scale = get_scale()
     raw = to_raw(pct, scale) if pct == 0 else max(MIN_RAW, to_raw(pct, scale))
     saved = [(off, ec_read(off)) for off in _table_offsets()]
-    flat = [(t, raw) for t in (40, 50, 60, 70, 80, 90, 97)]
+    flat = [(t, raw) for t in (30, 40, 50, 60, 70, 80, 90)]
 
     def stop(*_):
         raise SystemExit(0)

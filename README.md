@@ -99,13 +99,19 @@ sudo strixec-setcurve test 50 30    # hold 50 % for 30 s, then restore the previ
 - Writes are refused unless the DMI product or board name contains `MS-S1`.
   `--force` overrides this. Use it only on a board you have checked yourself.
 - A 0 % duty stops the fans. It is refused unless you pass `--allow-off`.
+- Record 7 of each fan table is treated as the firmware's protection band:
+  its 90–95 °C bounds stay as stock, its value is never lowered, and every
+  profile ends at 90 °C or below. See `docs/EC-MAP.md`.
 - The table is kept on the EC, so the fans keep the last curve with no daemon
   running. Use `sudo strixec-setcurve stock` to return to the factory curve.
 
 ### GUI
 
+![MS S1 Max fans control, light theme](docs/screenshots/gui-light.png)
+![MS S1 Max fans control, dark theme](docs/screenshots/gui-dark.png)
+
 Launch **MS S1 Max fans control** from the application menu, or run
-`strixec-gui`. It shows the live CPU temperature, the selected profile's curve,
+`strixec-gui`. The ⚙ Settings menu sets the fan scale and runs a speed test. It shows the live CPU temperature, the selected profile's curve,
 and applies profiles with one click (no password needed for users in `wheel`).
 
 ## Uninstall

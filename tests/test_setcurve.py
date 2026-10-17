@@ -185,6 +185,38 @@ class SetcurveTest(unittest.TestCase):
         self.assertEqual(self._image(), self.snapshot)
 
 
+class ProtectionBandTest(unittest.TestCase):
+    """Record 7 is the firmware protection band (plan-hwmon.md, Phase 0 step 7)."""
+
+    setUp = SetcurveTest.setUp
+    _image = SetcurveTest._image
+
+    def test_record_7_keeps_stock_bounds(self):
+        for name in self.sc.PROFILES:
+            recs = self.sc.points_to_records(self.sc.profile_raw(name, 100))
+            self.assertEqual(recs[7][1:], (95, 90), name)
+
+    def test_record_7_value_never_below_stock(self):
+        for name in self.sc.PROFILES:
+            for scale in (48, 100):
+                recs = self.sc.points_to_records(self.sc.profile_raw(name, scale))
+                self.assertGreaterEqual(recs[7][0], self.sc.PROTECT_VALUE_MIN, (name, scale))
+
+    def test_every_profile_ends_at_or_below_the_band(self):
+        for name in self.sc.PROFILES:
+            self.assertLessEqual(self.sc.PROFILES[name][-1][0], self.sc.PROTECT_LOWER, name)
+
+    def test_last_temperature_above_the_band_is_refused(self):
+        pts = [(40, 6), (50, 10), (60, 20), (70, 30), (80, 40), (85, 50), (91, 60)]
+        with self.assertRaises(SystemExit) as cm:
+            self.sc.points_to_records(pts)
+        self.assertIn("90", str(cm.exception))
+
+    def test_record_6_stops_where_record_7_starts(self):
+        recs = self.sc.points_to_records(self.sc.profile_raw("bilanciato", 100))
+        self.assertEqual(recs[6][1], self.sc.PROTECT_LOWER)
+
+
 class GuardTest(unittest.TestCase):
     """Board guard and zero-duty refusal, on the command line."""
 

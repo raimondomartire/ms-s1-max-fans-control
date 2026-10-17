@@ -42,6 +42,23 @@ the fans get record 0's value. Stock uses 0 there, which stops the fans below
 > `0x28` are not writable was also wrong: `0x26`/`0x27` are record 7's upper and
 > lower. `0x28`/`0x48` are volatile (firmware-updated) and are not curve bytes.
 
+### Record 7 is the protection band (decision)
+
+Record 7 (`0x25`–`0x27`, stock `40 / 95 / 90`) is treated as the firmware's own
+protection band. The evidence is indirect: the Minisforum UM790 driver never
+writes this record and reports a hard override to 100 % at ≥ 94 °C, and no
+other source describes a curve row above 90 °C. The rules `strixec-setcurve`
+follows:
+
+- its bounds stay at the stock 90–95 °C;
+- its value is never lowered below the stock 40; it takes the profile's last
+  duty when that is higher;
+- every profile ends at 90 °C or below, so record 6 stops where record 7 starts.
+
+Open: James's check on `0x25`–`0x27` (plan-hwmon.md, Phase 10 H4) can confirm or
+change this. If record 7 turns out not to be a protection band, the rule can be
+relaxed; until then it stays.
+
 ### Duty scale
 
 The raw value that means full speed is the fan scale. Default `100`, stored in

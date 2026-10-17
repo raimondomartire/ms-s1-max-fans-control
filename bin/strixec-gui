@@ -209,6 +209,7 @@ class CurveWidget(QFrame):
     edited = Signal()
 
     TMIN, TMAX = 30, 100
+    TMAX_LAST = 90           # last node stays at or below the protection band (record 7)
 
     def __init__(self):
         super().__init__()
@@ -267,7 +268,7 @@ class CurveWidget(QFrame):
         if self.drag >= 0:
             i = self.drag
             lo_t = self.pts[i - 1][0] + 1 if i > 0 else self.TMIN + 2
-            hi_t = self.pts[i + 1][0] - 1 if i < len(self.pts) - 1 else self.TMAX
+            hi_t = self.pts[i + 1][0] - 1 if i < len(self.pts) - 1 else self.TMAX_LAST
             nt = int(round(max(lo_t, min(hi_t, self._Tinv(e.position().x())))))
             nd = int(round(max(0, min(100, self._Dinv(e.position().y())))))
             self.pts[i] = [nt, nd]
