@@ -129,6 +129,22 @@ sudo depmod -a; sudo systemctl daemon-reload
 ```
 A reboot restores the firmware's stock fan curve.
 
+## Credits
+
+- **James** (MS-S1 MAX owner). Found the read/write position bug in the module
+  and sent the report. Ran the experiments that settled the table layout (the
+  band value is the first byte of an 8-record table at `0x10`), the full-speed
+  knee at 48, the rotation-tone measurement (value = RPM/100), and the lowest
+  speed of 9. The test plan and data are in his `plan-hwmon.md`.
+- **malwareslayer**, author of [minisforum-platform](https://github.com/malwareslayer/minisforum-platform).
+  Their driver for the sibling UM790 shows the same value-first layout, reads
+  the RPM/100 codes with a tachometer, and never writes the top record, which
+  they treat as a firmware protection row. That last point is what our record 7
+  rule follows.
+- **ibnbajja**, author of the [ec-su_axb35-linux](https://github.com/ibnbajja/ec-su_axb35-linux)
+  fork. The board check before writing to the EC and the minimum speed that the
+  curve never switches off are their ideas, adapted here.
+
 ## Author
 
 Raimondo Martire — <martireraimondo@gmail.com>

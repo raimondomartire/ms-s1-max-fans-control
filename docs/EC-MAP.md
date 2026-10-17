@@ -98,3 +98,11 @@ throttles under sustained load.
 - SELinux (enforcing) denies `module_load` for a `.ko` in `/opt` (`usr_t`) from
   a service context. The module is installed into
   `/lib/modules/<krel>/extra/` (`modules_object_t`) and loaded with `modprobe`.
+
+## Sources
+
+- Alignment, knee, rotation tone and the minimum speed: James's experiments and
+  `plan-hwmon.md` (2026-10-11 to 10-17).
+- Value-first layout and the protection row: [malwareslayer/minisforum-platform](https://github.com/malwareslayer/minisforum-platform)
+  (UM790 driver, `src/minisforum_hwmon.c`).
+- Board check and minimum speed: [ibnbajja/ec-su_axb35-linux](https://github.com/ibnbajja/ec-su_axb35-linux).
