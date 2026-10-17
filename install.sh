@@ -55,8 +55,10 @@ install -m 0644 "$HERE/polkit/49-strixec.rules" /etc/polkit-1/rules.d/49-strixec
 
 echo "==> Enabling services"
 systemctl daemon-reload
-systemctl enable --now strixec.service
-systemctl enable --now strixec-curve.service
+# restart, not --now: an already running service would keep the old module and the old table
+systemctl enable strixec.service strixec-curve.service
+systemctl restart strixec.service
+systemctl restart strixec-curve.service
 
 echo
 echo "Done. Active profile:"
