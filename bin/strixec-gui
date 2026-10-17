@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QComboBox, QFrame, QSizePolicy, QToolButton, QMenu, QInputDialog,
 )
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+JOB_TIMEOUT_MS = 120000   # pkexec with no answer (no polkit agent?) must not lock the window
 SETCURVE = "/usr/local/bin/strixec-setcurve"
 STATE = "/run/strixec/profile"
 ICON = "/usr/local/share/strixec/strixec-fan.svg"
@@ -40,6 +41,7 @@ TR = {
            "active": "active: {p}   ·   fan ~{d}", "hint": "Drag the nodes to edit the curve",
            "applying": "applying…", "applied": "✔ '{n}' applied", "error": "error: {e}",
            "cancelled": "authorization cancelled",
+           "timeout": "no answer from pkexec: check the authorization prompt",
            "settings": "⚙ Settings", "scale_item": "Fan scale…", "test_item": "Speed test…",
            "scale_title": "Fan scale", "scale_prompt": "Raw value for full speed (10–255).\n100 = default. 48 = hypothesis under test.",
            "scale_set": "✔ fan scale set to {n}", "test_title": "Speed test",
@@ -53,6 +55,7 @@ TR = {
            "active": "attivo: {p}   ·   ventola ~{d}", "hint": "Trascina i nodi per modificare la curva",
            "applying": "applico…", "applied": "✔ '{n}' applicato", "error": "errore: {e}",
            "cancelled": "autorizzazione annullata",
+           "timeout": "nessuna risposta da pkexec: controlla la richiesta di autorizzazione",
            "settings": "⚙ Impostazioni", "scale_item": "Scala ventole…", "test_item": "Prova velocità…",
            "scale_title": "Scala ventole", "scale_prompt": "Valore grezzo a pieno giri (10–255).\n100 = predefinito. 48 = ipotesi in verifica.",
            "scale_set": "✔ scala ventole impostata a {n}", "test_title": "Prova velocità",
@@ -551,6 +554,13 @@ class MainWin(QWidget):
         self.set_busy(True)
         self.msg_lbl.setText(busy_text)
         self.proc.start("pkexec", [SETCURVE] + args)
+        proc = self.proc
+        QTimer.singleShot(JOB_TIMEOUT_MS, lambda: self._expire(proc))
+
+    def _expire(self, proc):
+        if self.proc is proc and proc.state() != QProcess.NotRunning:
+            self.msg_lbl.setText(t("timeout"))
+            proc.kill()
 
     def set_busy(self, busy):
         for w in (self.apply_btn, self.combo, self.settings_btn):
